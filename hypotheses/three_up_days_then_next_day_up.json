@@ -1,0 +1,19 @@
+{
+  "type": "consecutive_return_continuation_v1",
+  "name": "three_up_3pct_then_next_day_up_1pct",
+  "hypothesis_text": "If a stock rises by more than 3% close-to-close for three consecutive trading days, then on the following trading day it will rise by more than 1% close-to-close.",
+  "return_basis": "vendor_adjusted_close",
+  "universe": {
+    "symbols": ["KO", "TSLA", "TWTR"],
+    "note": "The free vendor sample lacks symbols.csv, so V0.3 explicitly selects the three stock tickers and excludes SPY. The full package will use instrument_type=CS instead."
+  },
+  "signal": {
+    "daily_return_gt": 0.03,
+    "consecutive_days": 3,
+    "known_after": "close"
+  },
+  "outcome": {
+    "horizon_trading_days": 1,
+    "return_gt": 0.01
+  }
+}

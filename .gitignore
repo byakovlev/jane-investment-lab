@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Secrets
+.env
+*.key
+
+# Purchased / local market data
+data/vendor/
+data/raw/
+incoming/
+warehouse/
+results/
+
+# Large generated files
+*.parquet
+*.duckdb
+*.db
+*.zip

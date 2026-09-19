@@ -1,0 +1,4 @@
+duckdb>=1.4,<2
+pytest>=8,<10
+pandas>=2,<3
+jupyterlab>=4,<5
