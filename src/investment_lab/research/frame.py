@@ -129,10 +129,10 @@ def load_research_frame(
         df = df[df["ticker"].isin(symbols)]
 
     if start_date is not None:
-        df = df[df["trade_date"] >= pd.Timestamp(start_date).date()]
+        df = df[df["trade_date"] >= pd.Timestamp(start_date)]
 
     if end_date is not None:
-        df = df[df["trade_date"] <= pd.Timestamp(end_date).date()]
+        df = df[df["trade_date"] <= pd.Timestamp(end_date)]
 
     # Adjusted price levels are never prediction features.
     df = df.drop(columns=["adj_close"])
