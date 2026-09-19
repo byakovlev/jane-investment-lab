@@ -93,6 +93,8 @@ def test_future_labels_are_not_in_default_frame(tmp_path):
     build_test_warehouse(tmp_path)
     df = load_research_frame(root=tmp_path)
     assert not any(c.startswith("label_") for c in df.columns)
+    assert "adj_close" not in df.columns
+    assert "security_name" not in df.columns
 
 
 def test_labels_are_added_only_when_requested(tmp_path):

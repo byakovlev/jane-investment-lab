@@ -45,7 +45,6 @@ def load_research_frame(
             SELECT
                 r.security_id,
                 coalesce(h.identifier_value, r.source_symbol) AS ticker,
-                s.security_name,
                 s.instrument_type,
                 r.trade_date,
                 r.open,
