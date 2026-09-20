@@ -30,6 +30,7 @@ class Lifecycle:
     figi: str | None
     symbol_history: str | None
     metadata_completeness: str
+    local_file_name: str
     source_file_name: str
 
 
@@ -45,6 +46,33 @@ def load_manifest(root: Path) -> dict | None:
     path = root / "manifest.json"
     return json.loads(path.read_text()) if path.exists() else None
 
+def load_filename_map(root: Path) -> dict[str, str]:
+    path = root / "filename-map.json"
+    if not path.exists():
+        return {}
+
+    payload = json.loads(path.read_text())
+    mapping: dict[str, str] = {}
+
+    def walk(obj) -> None:
+        if isinstance(obj, dict):
+            original = obj.get("original_name")
+            local = obj.get("local_name")
+
+            if original and local and obj.get("active", True):
+                local_key = str(local).replace("\\", "/")
+                original_value = str(original).replace("\\", "/")
+                mapping[local_key] = original_value
+
+            for value in obj.values():
+                walk(value)
+
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+
+    walk(payload)
+    return mapping
 
 def verify_vendor_delivery(root: Path, extract: bool = False) -> tuple[bool, str]:
     verifier = root / "verify.py"
@@ -103,6 +131,7 @@ def _source_key(row: dict[str, str], terminal_symbol: str, delisted_at: str | No
 def build_lifecycles(root: Path) -> list[Lifecycle]:
     files = day_files(root)
     symbol_rows = _symbols_rows(root)
+    filename_map = load_filename_map(root)
 
     rows_by_key: dict[tuple[str, str | None], dict[str, str]] = {}
     for row in symbol_rows:
@@ -112,7 +141,11 @@ def build_lifecycles(root: Path) -> list[Lifecycle]:
 
     result: list[Lifecycle] = []
     for path in files:
-        symbol, delisted = parse_day_filename(path)
+        local_rel = path.relative_to(root).as_posix()
+        original_rel = filename_map.get(local_rel, local_rel)
+        original_name = Path(original_rel).name
+
+        symbol, delisted = parse_day_filename(Path(original_name))
         row = rows_by_key.get((symbol, delisted), {})
         status = (row.get("status") or ("delisted" if delisted else "active")).strip()
         source_key = _source_key(row, symbol, delisted)
@@ -130,7 +163,8 @@ def build_lifecycles(root: Path) -> list[Lifecycle]:
                 figi=(row.get("figi") or "").strip() or None,
                 symbol_history=(row.get("symbol_history") or "").strip() or None,
                 metadata_completeness="FULL" if row else "PROVISIONAL",
-                source_file_name=path.name,
+                local_file_name=path.name,
+                source_file_name=original_name,
             )
         )
     return result

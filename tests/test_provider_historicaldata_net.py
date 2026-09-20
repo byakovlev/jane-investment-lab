@@ -46,3 +46,38 @@ def test_sample_has_four_lifecycles_and_delisted_twitter():
         assert all(x.metadata_completeness == "PROVISIONAL" for x in lifecycles)
     finally:
         shutil.rmtree(d)
+
+def test_filename_map_resolves_original_vendor_name(tmp_path):
+    root = tmp_path
+    day_dir = root / "day_by_symbol"
+    day_dir.mkdir()
+
+    (day_dir / "AAPw_day_2.csv").write_text(
+        "date,open,high,low,close,volume,vwap,transactions,"
+        "adj_open,adj_high,adj_low,adj_close,adj_volume,adj_vwap,"
+        "dividend,dividend_type,split\n"
+        "2020-01-02,1,1,1,1,100,1,1,1,1,1,1,100,1,,,\n"
+    )
+
+    (root / "filename-map.json").write_text(
+        """
+        {
+          "files": [
+            {
+              "original_name": "day_by_symbol/AAPw_day.csv",
+              "local_name": "day_by_symbol/AAPw_day_2.csv",
+              "bytes": 0,
+              "sha256": "dummy",
+              "active": true
+            }
+          ]
+        }
+        """
+    )
+
+    lifecycles = build_lifecycles(root)
+
+    assert len(lifecycles) == 1
+    assert lifecycles[0].local_file_name == "AAPw_day_2.csv"
+    assert lifecycles[0].source_file_name == "AAPw_day.csv"
+    assert lifecycles[0].terminal_symbol == "AAPw"

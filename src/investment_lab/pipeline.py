@@ -44,9 +44,23 @@ def _sql_path(path: Path) -> str:
 def _write_lifecycle_map(path: Path, lifecycles) -> None:
     with path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["source_file_name", "security_id", "source_security_key", "terminal_symbol", "delisted_at"])
+        w.writerow([
+            "local_file_name",
+            "source_file_name",
+            "security_id",
+            "source_security_key",
+            "terminal_symbol",
+            "delisted_at",
+        ])
         for lc in lifecycles:
-            w.writerow([lc.source_file_name, lc.security_id, lc.source_security_key, lc.terminal_symbol, lc.delisted_at or ""])
+            w.writerow([
+                lc.local_file_name,
+                lc.source_file_name,
+                lc.security_id,
+                lc.source_security_key,
+                lc.terminal_symbol,
+                lc.delisted_at or "",
+            ])
 
 
 def _record_check(con, run_id: int, name: str, status: str, observed=None, expected=None, severity="ERROR", details=None):
@@ -164,12 +178,12 @@ def ingest_historicaldata_net(
     con.execute("DROP VIEW IF EXISTS _vendor_daily")
     con.execute(f"""
         CREATE TEMP VIEW _vendor_daily AS
-        SELECT *, regexp_extract(filename, '[^/\\\\]+$') AS source_file_name
+        SELECT *, regexp_extract(filename, '[^/\\\\]+$') AS local_file_name
         FROM read_csv('{glob}', header=true, columns={DAY_COLUMNS_SQL}, filename=true, nullstr='')
     """)
     stats = {row[0]: {"first": str(row[1]), "last": str(row[2]), "rows": row[3]}
              for row in con.execute("""
-                 SELECT source_file_name, min(date), max(date), count(*)
+                 SELECT local_file_name, min(date), max(date), count(*)
                  FROM _vendor_daily GROUP BY 1
              """).fetchall()}
 
@@ -181,7 +195,7 @@ def ingest_historicaldata_net(
 
         # Replace only the source lifecycle rows represented by this immutable dataset version.
         for lc in lifecycles:
-            s = stats.get(lc.source_file_name)
+            s = stats.get(lc.local_file_name)
             if not s:
                 raise RuntimeError(f"No data stats for {lc.source_file_name}")
             first_date, last_date = s["first"], s["last"]
@@ -226,8 +240,11 @@ def ingest_historicaldata_net(
 
         # Source file metadata from vendor manifests + actual daily scan.
         manifest_hashes = manifest_file_hashes(source_root)
+        lifecycle_by_local = {lc.local_file_name: lc for lc in lifecycles}
+
         for path in day_files(source_root):
-            rel = path.relative_to(source_root).as_posix()
+            lc = lifecycle_by_local[path.name]
+            rel = (Path("day_by_symbol") / lc.source_file_name).as_posix()
             s = stats[path.name]
             mbytes, msha = manifest_hashes.get(rel, (path.stat().st_size, None))
             con.execute(
@@ -243,7 +260,7 @@ def ingest_historicaldata_net(
             CREATE TEMP VIEW _raw_bars AS
             SELECT
                 m.security_id,
-                v.source_file_name,
+                m.source_file_name,
                 m.terminal_symbol AS source_symbol,
                 v.date AS trade_date,
                 year(v.date)::INTEGER AS trade_year,
@@ -252,14 +269,14 @@ def ingest_historicaldata_net(
                 'AFTER_SESSION_CLOSE'::VARCHAR AS availability_rule,
                 {dataset_version_id}::BIGINT AS source_dataset_version_id,
                 md5(concat_ws('|',
-                    v.source_file_name, cast(v.date as varchar),
+                    m.source_file_name, cast(v.date as varchar),
                     coalesce(cast(v.open as varchar),'<NULL>'), coalesce(cast(v.high as varchar),'<NULL>'),
                     coalesce(cast(v.low as varchar),'<NULL>'), coalesce(cast(v.close as varchar),'<NULL>'),
                     coalesce(cast(v.volume as varchar),'<NULL>'), coalesce(cast(v.vwap as varchar),'<NULL>'),
                     coalesce(cast(v.transactions as varchar),'<NULL>')
                 )) AS source_row_hash
             FROM _vendor_daily v
-            JOIN _lifecycle_map m USING (source_file_name)
+            JOIN _lifecycle_map m USING (local_file_name)
         """)
 
         # Vendor adjusted bars are useful for ex-post total-return math/validation, but their
@@ -269,7 +286,7 @@ def ingest_historicaldata_net(
             CREATE TEMP VIEW _adjusted_bars AS
             SELECT
                 m.security_id,
-                v.source_file_name,
+                m.source_file_name,
                 m.terminal_symbol AS source_symbol,
                 v.date AS trade_date,
                 year(v.date)::INTEGER AS trade_year,
@@ -277,7 +294,7 @@ def ingest_historicaldata_net(
                 'VENDOR_ARCHIVE_ADJUSTED_THROUGH_SNAPSHOT'::VARCHAR AS adjustment_basis,
                 {dataset_version_id}::BIGINT AS source_dataset_version_id
             FROM _vendor_daily v
-            JOIN _lifecycle_map m USING (source_file_name)
+            JOIN _lifecycle_map m USING (local_file_name)
         """)
 
         # Stream canonical views straight to partitioned Parquet. We avoid materializing the
@@ -326,8 +343,8 @@ def ingest_historicaldata_net(
         # Thus a dividend/split may be used only from its ex/effective date onward.
         con.execute("DELETE FROM corporate_action WHERE source_dataset_version_id=?", [dataset_version_id])
         action_rows = con.execute("""
-            SELECT m.security_id, v.source_file_name, v.date, v.dividend, v.dividend_type, v.split
-            FROM _vendor_daily v JOIN _lifecycle_map m USING (source_file_name)
+            SELECT m.security_id, m.source_file_name, v.date, v.dividend, v.dividend_type, v.split
+            FROM _vendor_daily v JOIN _lifecycle_map m USING (local_file_name)
             WHERE v.dividend IS NOT NULL OR v.split IS NOT NULL
             ORDER BY 1,3
         """).fetchall()
