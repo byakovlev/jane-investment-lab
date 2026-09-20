@@ -13,10 +13,24 @@ ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = ROOT / "vendor_samples" / "historicaldata_net_sample_2022H2.zip"
 
 
-def test_full_sample_ingestion():
-    shutil.rmtree(ROOT / "warehouse", ignore_errors=True)
-    subprocess.run([sys.executable, str(ROOT / "scripts" / "ingest_historicaldata.py"), str(SAMPLE)], check=True)
-    con = duckdb.connect(str(ROOT / "warehouse" / "metadata.duckdb"), read_only=True)
+def test_full_sample_ingestion(tmp_path):
+    project_root = tmp_path / "project"
+    (project_root / "schema").mkdir(parents=True)
+    shutil.copy2(
+        ROOT / "schema" / "001_core.sql",
+        project_root / "schema" / "001_core.sql",
+    )
+    subprocess.run(
+        [
+               sys.executable,
+            str(ROOT / "scripts" / "ingest_historicaldata.py"),
+            str(SAMPLE),
+            "--project-root",
+            str(project_root),
+        ],
+        check=True,
+    )
+    con = duckdb.connect(str(project_root / "warehouse" / "metadata.duckdb"), read_only=True)
     assert con.execute("select count(*) from bars_daily_current").fetchone()[0] == 464
     assert con.execute("select count(*) from security").fetchone()[0] == 4
     assert con.execute("select count(*) from corporate_action where action_type='DIVIDEND'").fetchone()[0] == 4
