@@ -179,38 +179,72 @@ def ingest_historicaldata_net(
     con.execute((project_root / "schema" / "001_core.sql").read_text())
 
     fingerprint = source_fingerprint(source_root)
-    dataset_version_id = stable_bigint("dataset_version", f"{DATASET_ID}|{fingerprint}|{PIPELINE_VERSION}")
-    run_id = stable_bigint("ingestion_run", f"{dataset_version_id}|{PIPELINE_VERSION}")
-    canonical_root = warehouse / "canonical" / "historicaldata_net" / f"dataset_version={dataset_version_id}"
-    raw_root = canonical_root / "bars_daily_raw"
-    adjusted_root = canonical_root / "bars_daily_vendor_adjusted"
-
     con.execute(
         """INSERT OR IGNORE INTO dataset VALUES (?, ?, ?, ?, ?, ?, ?)""",
         [DATASET_ID, "HistoricalData.net US equities daily", PROVIDER, "EQUITY", "DAILY",
          "Vendor daily US equity archive; raw bars plus separately preserved archive-adjusted bars.", _now()],
     )
 
+    # A label identifies a source delivery, independently of the implementation
+    # that attempted to ingest it. Resolve it before changing any derived state.
     existing = con.execute(
-        "SELECT status FROM dataset_version WHERE dataset_version_id=?", [dataset_version_id]
+        """SELECT dataset_version_id, status, source_fingerprint_sha256, pipeline_version,
+                  canonical_raw_uri, canonical_adjusted_uri
+           FROM dataset_version WHERE dataset_id=? AND version_label=?""",
+        [DATASET_ID, version_label],
     ).fetchone()
-    if existing and existing[0] == "READY" and raw_root.exists() and adjusted_root.exists():
-        _create_current_views(con, raw_root, adjusted_root)
-        row = con.execute(
-            "SELECT summary_json FROM ingestion_run WHERE dataset_version_id=? AND status='SUCCEEDED' ORDER BY finished_at DESC LIMIT 1",
-            [dataset_version_id],
-        ).fetchone()
-        summary = row[0] if row else None
-        con.close()
-        if isinstance(summary, str):
-            return json.loads(summary)
-        return summary or {"dataset_version_id": dataset_version_id, "status": "READY"}
+    if existing:
+        dataset_version_id, status, stored_fingerprint, stored_pipeline, raw_uri, adjusted_uri = existing
+        if stored_fingerprint != fingerprint:
+            con.close()
+            raise RuntimeError(
+                f"Dataset label {version_label!r} already exists with a different source fingerprint: "
+                f"stored={stored_fingerprint}, requested={fingerprint}; use a different label."
+            )
+        if status == "READY":
+            if stored_pipeline != PIPELINE_VERSION:
+                con.close()
+                raise RuntimeError(
+                    f"Dataset label {version_label!r} is already READY under {stored_pipeline}; "
+                    f"cannot rebuild it with {PIPELINE_VERSION}. Use a different label."
+                )
+            raw_root = Path(raw_uri) if raw_uri else None
+            adjusted_root = Path(adjusted_uri) if adjusted_uri else None
+            if not (raw_root and adjusted_root and any(raw_root.rglob("*.parquet"))
+                    and any(adjusted_root.rglob("*.parquet"))):
+                con.close()
+                raise RuntimeError(
+                    f"Dataset label {version_label!r} is already READY but canonical files are missing; "
+                    "refusing to overwrite it."
+                )
+            _create_current_views(con, raw_root, adjusted_root)
+            row = con.execute(
+                "SELECT summary_json FROM ingestion_run WHERE dataset_version_id=? AND status='SUCCEEDED' ORDER BY finished_at DESC LIMIT 1",
+                [dataset_version_id],
+            ).fetchone()
+            summary = row[0] if row else None
+            con.close()
+            if isinstance(summary, str):
+                return json.loads(summary)
+            return summary or {"dataset_version_id": dataset_version_id, "status": "READY"}
+        if status not in {"REJECTED", "INGESTING"}:
+            con.close()
+            raise RuntimeError(f"Dataset label {version_label!r} has status {status}; cannot retry it.")
+    else:
+        dataset_version_id = stable_bigint("dataset_version", f"{DATASET_ID}|{version_label}|{fingerprint}")
 
-    # Re-running a failed/incomplete copy is safe: derived rows for this exact dataset/pipeline
-    # version are cleared, while the immutable dataset_version identity remains stable.
+    # Preserve previous attempts and their quality diagnostics as provenance.
+    # Each retry gets a fresh run; the source version and stable identities persist.
+    run_id = stable_bigint("ingestion_run", f"{dataset_version_id}|{PIPELINE_VERSION}|{_now()}")
+    canonical_root = warehouse / "canonical" / "historicaldata_net" / f"dataset_version={dataset_version_id}"
+    raw_root = canonical_root / "bars_daily_raw"
+    adjusted_root = canonical_root / "bars_daily_vendor_adjusted"
+    con.execute(
+        """UPDATE ingestion_run SET status='FAILED', finished_at=?
+           WHERE dataset_version_id=? AND status='RUNNING'""",
+        [_now(), dataset_version_id],
+    )
     con.execute("DELETE FROM identity_history_quarantine WHERE dataset_version_id=?", [dataset_version_id])
-    con.execute("DELETE FROM quality_check_result WHERE ingestion_run_id=?", [run_id])
-    con.execute("DELETE FROM ingestion_run WHERE ingestion_run_id=?", [run_id])
     con.execute("DELETE FROM corporate_action WHERE source_dataset_version_id=?", [dataset_version_id])
     con.execute("DELETE FROM source_file WHERE dataset_version_id=?", [dataset_version_id])
     con.execute("DELETE FROM security_identifier_history WHERE source_dataset_version_id=?", [dataset_version_id])
@@ -223,10 +257,10 @@ def ingest_historicaldata_net(
 
     if existing:
         con.execute(
-            """UPDATE dataset_version SET version_label=?, source_asof=?, retrieved_at=?, raw_uri=?,
-               source_fingerprint_sha256=?, canonical_raw_uri=?, canonical_adjusted_uri=?, row_count=NULL,
+            """UPDATE dataset_version SET source_asof=coalesce(?, source_asof), retrieved_at=?, raw_uri=?,
+               canonical_raw_uri=?, canonical_adjusted_uri=?, row_count=NULL,
                status='INGESTING', pipeline_version=?, notes=? WHERE dataset_version_id=?""",
-            [version_label, source_asof, _now(), str(source_root), fingerprint, str(raw_root), str(adjusted_root),
+            [source_asof, _now(), str(source_root), str(raw_root), str(adjusted_root),
              PIPELINE_VERSION, "HistoricalData.net delivery ingested without altering source files.", dataset_version_id],
         )
     else:

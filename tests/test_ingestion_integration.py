@@ -290,3 +290,97 @@ def test_structural_failures_not_identity_quarantined(quarantine_delivery, monke
     with duckdb.connect(str(project / "warehouse/metadata.duckdb")) as con:
         assert con.execute("SELECT status FROM dataset_version").fetchone()[0] == "REJECTED"
         assert con.execute("SELECT status FROM ingestion_run").fetchone()[0] == "FAILED"
+
+
+@pytest.mark.parametrize("retry_status", ["REJECTED", "INGESTING"])
+def test_retry_reuses_legacy_version_and_preserves_provenance(quarantine_delivery, monkeypatch, retry_status):
+    import json
+    from dataclasses import replace
+    from investment_lab import pipeline
+
+    source, project = quarantine_delivery
+    # An unrelated label for the same source must survive the retry untouched.
+    other = pipeline.ingest_historicaldata_net(source, project, "other", extract_sample=True)
+    lifecycles = pipeline.build_lifecycles(source)
+    lifecycles[0] = replace(lifecycles[0], symbol_history="LATER:2022-08-01|EARLIER:2022-07-01")
+    monkeypatch.setattr(pipeline, "build_lifecycles", lambda root: lifecycles)
+    current_pipeline = pipeline.PIPELINE_VERSION
+    stable_bigint = pipeline.stable_bigint
+    fingerprint = pipeline.source_fingerprint(source)
+    legacy_id = stable_bigint("dataset_version", f"{pipeline.DATASET_ID}|{fingerprint}|investment-lab-v0.2")
+    with monkeypatch.context() as legacy:
+        legacy.setattr(pipeline, "PIPELINE_VERSION", "investment-lab-v0.2")
+        legacy.setattr(pipeline, "stable_bigint", lambda namespace, key: legacy_id if namespace == "dataset_version" else stable_bigint(namespace, key))
+        previous = pipeline.ingest_historicaldata_net(source, project, "retry", source_asof="2022-12-31", extract_sample=True)
+    db = str(project / "warehouse/metadata.duckdb")
+    with duckdb.connect(db) as con:
+        con.execute("UPDATE dataset_version SET status=? WHERE dataset_version_id=?", [retry_status, legacy_id])
+        con.execute("UPDATE ingestion_run SET status=? WHERE ingestion_run_id=?", ["RUNNING" if retry_status == "INGESTING" else "FAILED", previous["ingestion_run_id"]])
+        old_checks = con.execute("SELECT * FROM quality_check_result WHERE ingestion_run_id=? ORDER BY check_name", [previous["ingestion_run_id"]]).fetchall()
+        other_version = con.execute("SELECT * FROM dataset_version WHERE dataset_version_id=?", [other["dataset_version_id"]]).fetchone()
+        # A stale quarantine must disappear; real exceptions must be rebuilt for the new run.
+        con.execute("INSERT INTO identity_history_quarantine VALUES (?, ?, ?, '{}')", [legacy_id, 999, previous["ingestion_run_id"]])
+    stale_file = Path(previous["raw_parquet"]) / "stale.txt"
+    stale_file.write_text("incomplete prior output")
+    retried = pipeline.ingest_historicaldata_net(source, project, "retry", extract_sample=True)
+    assert retried["dataset_version_id"] == legacy_id
+    assert retried["ingestion_run_id"] != previous["ingestion_run_id"]
+    assert retried["identity_quarantined_securities"] == 1
+    assert not stale_file.exists()
+    with duckdb.connect(db) as con:
+        assert con.execute("SELECT count(*) FROM dataset_version").fetchone()[0] == 2
+        assert con.execute("SELECT * FROM dataset_version WHERE dataset_version_id=?", [other["dataset_version_id"]]).fetchone() == other_version
+        assert con.execute("SELECT status,pipeline_version,source_fingerprint_sha256,cast(source_asof AS VARCHAR) FROM dataset_version WHERE dataset_version_id=?", [legacy_id]).fetchone() == ("READY", current_pipeline, fingerprint, "2022-12-31")
+        assert con.execute("SELECT status,pipeline_version FROM ingestion_run WHERE ingestion_run_id=?", [previous["ingestion_run_id"]]).fetchone() == ("FAILED", "investment-lab-v0.2")
+        assert con.execute("SELECT * FROM quality_check_result WHERE ingestion_run_id=? ORDER BY check_name", [previous["ingestion_run_id"]]).fetchall() == old_checks
+        quarantines = con.execute("SELECT security_id,ingestion_run_id,details_json FROM identity_history_quarantine WHERE dataset_version_id=?", [legacy_id]).fetchall()
+        assert len(quarantines) == 1
+        assert quarantines[0][:2] == (lifecycles[0].security_id, retried["ingestion_run_id"])
+        assert json.loads(quarantines[0][2])["source_files"][0]["source_file_name"] == lifecycles[0].source_file_name
+        assert con.execute("SELECT count(*) FROM source_file WHERE dataset_version_id=?", [legacy_id]).fetchone()[0] == 4
+        assert con.execute("SELECT count(*) FROM bars_daily_raw_current").fetchone()[0] == 464
+        assert con.execute("SELECT count(*) FROM bars_daily_current").fetchone()[0] == 337
+    assert pipeline.ingest_historicaldata_net(source, project, "retry") == retried
+    assert pipeline.ingest_historicaldata_net(source, project, "other") == other
+
+
+@pytest.mark.parametrize("status", ["REJECTED", "INGESTING", "READY"])
+def test_label_fingerprint_mismatch_preserves_existing_version(quarantine_delivery, monkeypatch, status):
+    from investment_lab import pipeline
+
+    source, project = quarantine_delivery
+    summary = pipeline.ingest_historicaldata_net(source, project, "fixed-label", extract_sample=True)
+    db = str(project / "warehouse/metadata.duckdb")
+    with duckdb.connect(db) as con:
+        con.execute("UPDATE dataset_version SET status=?", [status])
+        before = con.execute("SELECT * FROM dataset_version").fetchall()
+        runs = con.execute("SELECT * FROM ingestion_run").fetchall()
+    monkeypatch.setattr(pipeline, "source_fingerprint", lambda root: "different-fingerprint")
+    with pytest.raises(RuntimeError, match="different source fingerprint"):
+        pipeline.ingest_historicaldata_net(source, project, "fixed-label")
+    with duckdb.connect(db) as con:
+        assert con.execute("SELECT * FROM dataset_version").fetchall() == before
+        assert con.execute("SELECT * FROM ingestion_run").fetchall() == runs
+    assert any(Path(summary["raw_parquet"]).rglob("*.parquet"))
+
+
+@pytest.mark.parametrize("change", ["pipeline", "missing_files"])
+def test_ready_label_never_rebuilt(quarantine_delivery, monkeypatch, change):
+    from investment_lab import pipeline
+
+    source, project = quarantine_delivery
+    summary = pipeline.ingest_historicaldata_net(source, project, "ready", extract_sample=True)
+    if change == "pipeline":
+        monkeypatch.setattr(pipeline, "PIPELINE_VERSION", "future-pipeline")
+    else:
+        for path in Path(summary["raw_parquet"]).rglob("*.parquet"):
+            path.unlink()
+    db = str(project / "warehouse/metadata.duckdb")
+    with duckdb.connect(db) as con:
+        before = con.execute("SELECT * FROM dataset_version").fetchall()
+        runs = con.execute("SELECT * FROM ingestion_run").fetchall()
+    with pytest.raises(RuntimeError, match="already READY"):
+        pipeline.ingest_historicaldata_net(source, project, "ready")
+    with duckdb.connect(db) as con:
+        assert con.execute("SELECT * FROM dataset_version").fetchall() == before
+        assert con.execute("SELECT * FROM ingestion_run").fetchall() == runs
