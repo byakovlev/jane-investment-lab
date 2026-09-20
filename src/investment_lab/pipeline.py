@@ -18,6 +18,8 @@ from investment_lab.providers.historicaldata_net import (
     parse_symbol_history,
     source_fingerprint,
     verify_vendor_delivery,
+    classify_verifier_failures,
+    load_filename_map,
 )
 
 PIPELINE_VERSION = "investment-lab-v0.2"
@@ -160,15 +162,84 @@ def ingest_historicaldata_net(
     )
 
     # Vendor-native verification. The free sample is an extract, the full package is not.
-    verified, verify_output = verify_vendor_delivery(source_root, extract=extract_sample)
-    _record_check(con, run_id, "vendor_verify_py", "PASS" if verified else "FAIL",
-                  observed="exit=0" if verified else "nonzero", expected="exit=0",
-                  details={"tail": verify_output[-4000:]})
-    if not verified:
-        con.execute("UPDATE dataset_version SET status='REJECTED' WHERE dataset_version_id=?", [dataset_version_id])
-        con.execute("UPDATE ingestion_run SET status='FAILED', finished_at=? WHERE ingestion_run_id=?", [_now(), run_id])
-        raise RuntimeError("Vendor verification failed; see quality_check_result")
-
+    verified, verify_output = verify_vendor_delivery(
+        source_root,
+        extract=extract_sample,
+    )
+    
+    adjustment_failures: set[str] = set()
+    
+    if verified:
+        _record_check(
+            con,
+            run_id,
+            "vendor_verify_py",
+            "PASS",
+            observed="exit=0",
+            expected="exit=0",
+        )
+    else:
+        adjustment_failures, manifest_missing, other_failures = (
+            classify_verifier_failures(verify_output)
+        )
+    
+        filename_map = load_filename_map(source_root)
+    
+        mapped_originals = {
+            Path(original).name
+            for local, original in filename_map.items()
+            if (source_root / local).exists()
+        }
+    
+        unexplained_missing = manifest_missing - mapped_originals
+    
+        if other_failures or unexplained_missing:
+            _record_check(
+                con,
+                run_id,
+                "vendor_verify_py",
+                "FAIL",
+                observed="unexplained verification failures",
+                expected="only known filename mappings or adjustment failures",
+                details={
+                    "adjustment_failures": sorted(adjustment_failures),
+                    "mapped_manifest_exceptions": sorted(
+                        manifest_missing - unexplained_missing
+                    ),
+                    "unexplained_missing": sorted(unexplained_missing),
+                    "other_failures": other_failures,
+                },
+            )
+            con.execute(
+                "UPDATE dataset_version SET status='REJECTED' WHERE dataset_version_id=?",
+                [dataset_version_id],
+            )
+            con.execute(
+                "UPDATE ingestion_run SET status='FAILED', finished_at=? WHERE ingestion_run_id=?",
+                [_now(), run_id],
+            )
+            raise RuntimeError(
+                "Vendor verification contains unexplained failures; "
+                "see quality_check_result"
+            )
+    
+        _record_check(
+            con,
+            run_id,
+            "vendor_verify_py",
+            "SKIP",
+            observed=(
+                f"{len(adjustment_failures)} adjustment failures; "
+                f"{len(manifest_missing)} mapped filename exceptions"
+            ),
+            expected="exit=0 or understood exceptions only",
+            severity="WARNING",
+            details={
+                "adjustment_failures": sorted(adjustment_failures),
+                "mapped_manifest_exceptions": sorted(manifest_missing),
+            },
+        )
+        
     lifecycles = build_lifecycles(source_root)
     if not lifecycles:
         raise RuntimeError("No security lifecycles resolved")

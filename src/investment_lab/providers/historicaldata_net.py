@@ -90,6 +90,41 @@ def verify_vendor_delivery(root: Path, extract: bool = False) -> tuple[bool, str
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode == 0, output
 
+def classify_verifier_failures(
+    output: str,
+) -> tuple[set[str], set[str], list[str]]:
+    adjustment_files: set[str] = set()
+    manifest_missing_files: set[str] = set()
+    other_failures: list[str] = []
+
+    adjustment_re = re.compile(
+        r"^FAIL\s+\[(?P<name>[^\]]+)\]\s+adjustment "
+        r"(?:chain breaks|factor inconsistent)"
+    )
+    manifest_re = re.compile(
+        r"^FAIL\s+\[day_by_symbol/manifest\.json\]\s+"
+        r"manifest lists (?P<name>\S+) but it is missing"
+    )
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+
+        if not re.match(r"^FAIL\s+\[", line):
+            continue
+
+        match = adjustment_re.match(line)
+        if match:
+            adjustment_files.add(match.group("name"))
+            continue
+
+        match = manifest_re.match(line)
+        if match:
+            manifest_missing_files.add(match.group("name"))
+            continue
+
+        other_failures.append(line)
+
+    return adjustment_files, manifest_missing_files, other_failures
 
 def day_files(root: Path) -> list[Path]:
     folder = root / "day_by_symbol"

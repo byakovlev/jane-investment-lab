@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from investment_lab.providers.historicaldata_net import build_lifecycles, parse_day_filename, verify_vendor_delivery
+from investment_lab.providers.historicaldata_net import build_lifecycles, parse_day_filename, verify_vendor_delivery, classify_verifier_failures
 
 SAMPLE = ROOT / "vendor_samples" / "historicaldata_net_sample_2022H2.zip"
 
@@ -81,3 +81,22 @@ def test_filename_map_resolves_original_vendor_name(tmp_path):
     assert lifecycles[0].local_file_name == "AAPw_day_2.csv"
     assert lifecycles[0].source_file_name == "AAPw_day.csv"
     assert lifecycles[0].terminal_symbol == "AAPw"
+
+def test_verifier_failure_classification():
+    output = """
+    FAIL  [AMCR_day.csv] adjustment chain breaks at 1 boundaries (first: 2019-06-11)
+    FAIL  [SPAB_day_delisted_2009-05-04.csv] adjustment factor inconsistent on 4 rows
+    FAIL  [day_by_symbol/manifest.json] manifest lists AAPw_day.csv but it is missing
+    FAIL  [something.csv] unexpected structural problem
+    """
+
+    adjustment, missing, other = classify_verifier_failures(output)
+
+    assert adjustment == {
+        "AMCR_day.csv",
+        "SPAB_day_delisted_2009-05-04.csv",
+    }
+    assert missing == {"AAPw_day.csv"}
+    assert other == [
+        "FAIL  [something.csv] unexpected structural problem"
+    ]
