@@ -193,7 +193,7 @@ def ingest_historicaldata_net(
     
         unexplained_missing = manifest_missing - mapped_originals
     
-        if other_failures or unexplained_missing:
+        if other_failures or unexplained_missing or not (adjustment_failures or manifest_missing):
             _record_check(
                 con,
                 run_id,
@@ -243,6 +243,22 @@ def ingest_historicaldata_net(
     lifecycles = build_lifecycles(source_root)
     if not lifecycles:
         raise RuntimeError("No security lifecycles resolved")
+
+    # Verifier names may refer to the local file or its original vendor name.
+    failed_names = {Path(name.replace("\\", "/")).name for name in adjustment_failures}
+    quarantined_lifecycles = [
+        lc for lc in lifecycles
+        if lc.local_file_name in failed_names or lc.source_file_name in failed_names
+    ]
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE _adjustment_quarantine "
+        "(source_file_name VARCHAR)"
+    )
+    if quarantined_lifecycles:
+        con.executemany(
+            "INSERT INTO _adjustment_quarantine VALUES (?)",
+            [(lc.source_file_name,) for lc in quarantined_lifecycles],
+        )
 
     # One pass over all daily files with the vendor's fixed schema.
     glob = _sql_path(source_root / "day_by_symbol" / "*.csv")
@@ -366,12 +382,20 @@ def ingest_historicaldata_net(
                 {dataset_version_id}::BIGINT AS source_dataset_version_id
             FROM _vendor_daily v
             JOIN _lifecycle_map m USING (local_file_name)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM _adjustment_quarantine q
+                WHERE q.source_file_name = m.source_file_name
+            )
         """)
 
         # Stream canonical views straight to partitioned Parquet. We avoid materializing the
         # whole archive inside metadata.duckdb; the database stays a catalogue, not a warehouse.
         con.execute(f"COPY (SELECT * FROM _raw_bars) TO '{_sql_path(raw_root)}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (trade_year), OVERWRITE_OR_IGNORE)")
         con.execute(f"COPY (SELECT * FROM _adjusted_bars) TO '{_sql_path(adjusted_root)}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (trade_year), OVERWRITE_OR_IGNORE)")
+        # Partitioned COPY emits no files when every adjusted history is quarantined.
+        # Preserve a readable, schema-carrying dataset for current views and reruns.
+        if not any(adjusted_root.rglob("*.parquet")):
+            con.execute(f"COPY (SELECT * FROM _adjusted_bars LIMIT 0) TO '{_sql_path(adjusted_root / 'empty.parquet')}' (FORMAT PARQUET, COMPRESSION ZSTD)")
         con.execute("DROP VIEW IF EXISTS bars_daily_current")
         con.execute("DROP VIEW IF EXISTS vendor_adjusted_daily_current")
         con.execute(f"CREATE VIEW bars_daily_current AS SELECT * FROM read_parquet('{_sql_path(raw_root)}/**/*.parquet', hive_partitioning=true)")
@@ -380,6 +404,16 @@ def ingest_historicaldata_net(
         vendor_count = sum(x["rows"] for x in stats.values())
         raw_count = con.execute("SELECT count(*) FROM bars_daily_current").fetchone()[0]
         adjusted_count = con.execute("SELECT count(*) FROM vendor_adjusted_daily_current").fetchone()[0]
+        quarantined_file_count = len(quarantined_lifecycles)
+        quarantined_row_count = sum(stats[lc.local_file_name]["rows"] for lc in quarantined_lifecycles)
+        for name, count in (
+            ("adjusted_quarantined_files", quarantined_file_count),
+            ("adjusted_quarantined_rows", quarantined_row_count),
+        ):
+            _record_check(
+                con, run_id, name, "SKIP" if count else "PASS", count, 0,
+                severity="WARNING" if count else "INFO",
+            )
         unresolved = vendor_count - raw_count
         duplicate_keys = con.execute("""
             SELECT count(*) FROM (
@@ -398,7 +432,8 @@ def ingest_historicaldata_net(
 
         checks = [
             ("canonical_row_count_matches_vendor", raw_count == vendor_count, raw_count, vendor_count),
-            ("adjusted_row_count_matches_vendor", adjusted_count == vendor_count, adjusted_count, vendor_count),
+            ("adjusted_row_count_matches_vendor", adjusted_count == vendor_count - quarantined_row_count,
+             adjusted_count, vendor_count - quarantined_row_count),
             ("all_files_resolved_to_security", unresolved == 0, unresolved, 0),
             ("no_duplicate_security_dates", duplicate_keys == 0, duplicate_keys, 0),
             ("ohlc_invariants", invalid_ohlc == 0, invalid_ohlc, 0),
@@ -480,6 +515,9 @@ def ingest_historicaldata_net(
             "source_fingerprint_sha256": fingerprint,
             "daily_files": len(lifecycles),
             "daily_rows": raw_count,
+            "adjusted_rows": adjusted_count,
+            "adjusted_quarantined_files": quarantined_file_count,
+            "adjusted_quarantined_rows": quarantined_row_count,
             "securities": len(lifecycles),
             "provisional_security_metadata": provisional,
             "corporate_actions": action_count,
