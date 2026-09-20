@@ -33,6 +33,15 @@ def load_research_frame(
             "SELECT DISTINCT source_dataset_version_id FROM bars_daily_current"
         ).fetchall()
 
+        # An entirely quarantined delivery has no eligible bars, but still has a
+        # current raw dataset version. Return an empty frame in that case.
+        if not version_rows and con.execute(
+            "SELECT count(*) FROM duckdb_views() WHERE view_name='bars_daily_raw_current'"
+        ).fetchone()[0]:
+            version_rows = con.execute(
+                "SELECT DISTINCT source_dataset_version_id FROM bars_daily_raw_current"
+            ).fetchall()
+
         if len(version_rows) != 1:
             raise RuntimeError(
                 f"Expected one current dataset version; found {version_rows}"

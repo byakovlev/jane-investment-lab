@@ -210,9 +210,11 @@ def parse_symbol_history(lifecycle: Lifecycle, first_date: str, last_date: str) 
 
     symbols.csv uses SYMBOL:from_date|SYMBOL2:from_date. The free sample does
     not ship symbols.csv, so its terminal symbol is provisional over the file range.
+    Delisted ticker intervals end on the last observed trading date; delisted_at
+    is an administrative lifecycle date, not an inclusive trading boundary.
     """
     if not lifecycle.symbol_history:
-        end = lifecycle.delisted_at or None
+        end = last_date if lifecycle.delisted_at else None
         return [(lifecycle.terminal_symbol, first_date, end)]
 
     items: list[tuple[str, str]] = []
@@ -226,7 +228,7 @@ def parse_symbol_history(lifecycle: Lifecycle, first_date: str, last_date: str) 
             next_start = date.fromisoformat(items[i + 1][1])
             end = (next_start - timedelta(days=1)).isoformat()
         else:
-            end = lifecycle.delisted_at or None
+            end = last_date if lifecycle.delisted_at else None
         intervals.append((symbol, start, end))
     return intervals
 

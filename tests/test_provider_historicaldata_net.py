@@ -100,3 +100,27 @@ def test_verifier_failure_classification():
     assert other == [
         "FAIL  [something.csv] unexpected structural problem"
     ]
+
+def test_ticker_interval_ends_use_observed_dates():
+    from dataclasses import replace
+    from investment_lab.providers.historicaldata_net import Lifecycle, parse_symbol_history
+
+    lifecycle = Lifecycle(
+        source_security_key="FIGI:TEST", security_id=1, terminal_symbol="NEW",
+        status="delisted", delisted_at="2025-06-09", name="Test", instrument_type="ETF",
+        exchange="BATS", cik=None, figi="TEST", symbol_history=None,
+        metadata_completeness="FULL", local_file_name="NEW_day.csv", source_file_name="NEW_day.csv",
+    )
+    assert parse_symbol_history(lifecycle, "2025-01-02", "2025-06-05") == [
+        ("NEW", "2025-01-02", "2025-06-05"),
+    ]
+    with_history = replace(lifecycle, symbol_history="OLD:2024-01-02|NEW:2025-01-02")
+    assert parse_symbol_history(with_history, "2024-01-02", "2025-06-05") == [
+        ("OLD", "2024-01-02", "2025-01-01"),
+        ("NEW", "2025-01-02", "2025-06-05"),
+    ]
+    for lc in (lifecycle, with_history):
+        active = replace(lc, status="active", delisted_at=None)
+        assert parse_symbol_history(active, "2025-01-02", "2025-06-05")[-1] == (
+            "NEW", "2025-01-02", None,
+        )
