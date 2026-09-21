@@ -163,16 +163,39 @@ def _source_key(row: dict[str, str], terminal_symbol: str, delisted_at: str | No
     return f"SYMBOL:{terminal_symbol}|DELISTED:{delisted_at or ''}"
 
 
+def _resolve_lifecycle_row(candidates, source_file_name: str, delisted: str | None):
+    """Match status after the original filename's exact symbol and delisting date."""
+    if not candidates:
+        return {}
+    expected_status = "delisted" if delisted else "active"
+    matching = [(line, row) for line, row in candidates
+                if (row.get("status") or "").strip() == expected_status]
+    if not matching:
+        # Older metadata may omit status; an explicit incompatible status is not
+        # a fallback. In particular, renamed describes a previous symbol holder.
+        matching = [(line, row) for line, row in candidates
+                    if not (row.get("status") or "").strip()]
+    if len(matching) != 1:
+        reason = "Ambiguous" if matching else "Incompatible"
+        details = [{"symbols_csv_line": line, **row} for line, row in (matching or candidates)]
+        raise ValueError(
+            f"{reason} symbols.csv lifecycle metadata for {source_file_name}; "
+            f"expected status={expected_status}, delisted_at={delisted!r}; "
+            f"candidates={json.dumps(details, sort_keys=True)}"
+        )
+    return matching[0][1]
+
+
 def build_lifecycles(root: Path) -> list[Lifecycle]:
     files = day_files(root)
     symbol_rows = _symbols_rows(root)
     filename_map = load_filename_map(root)
 
-    rows_by_key: dict[tuple[str, str | None], dict[str, str]] = {}
-    for row in symbol_rows:
+    rows_by_key: dict[tuple[str, str | None], list[tuple[int, dict[str, str]]]] = {}
+    for line, row in enumerate(symbol_rows, start=2):
         symbol = (row.get("symbol") or "").strip()
         delisted = (row.get("delisted_at") or "").strip() or None
-        rows_by_key[(symbol, delisted)] = row
+        rows_by_key.setdefault((symbol, delisted), []).append((line, row))
 
     result: list[Lifecycle] = []
     for path in files:
@@ -181,7 +204,7 @@ def build_lifecycles(root: Path) -> list[Lifecycle]:
         original_name = Path(original_rel).name
 
         symbol, delisted = parse_day_filename(Path(original_name))
-        row = rows_by_key.get((symbol, delisted), {})
+        row = _resolve_lifecycle_row(rows_by_key.get((symbol, delisted), []), original_name, delisted)
         status = (row.get("status") or ("delisted" if delisted else "active")).strip()
         source_key = _source_key(row, symbol, delisted)
         result.append(

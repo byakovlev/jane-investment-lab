@@ -124,3 +124,74 @@ def test_ticker_interval_ends_use_observed_dates():
         assert parse_symbol_history(active, "2025-01-02", "2025-06-05")[-1] == (
             "NEW", "2025-01-02", None,
         )
+
+
+import pytest
+
+
+@pytest.mark.parametrize("symbol,active_figi,renamed_figi", [
+    ("XPER", "BBG019FGSSM1", "BBG00RBFBL50"),
+    ("BAM", "BBG01BPHNXZ3", "BBG000C9KL89"),
+    ("CR", "BBG016G0L0Q5", "BBG017BXPZ85"),
+    ("MSGE", "BBG019980TD4", "BBG00L9HLWV8"),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_active_lifecycle_wins_over_renamed_holder(tmp_path, symbol, active_figi, renamed_figi, reverse):
+    import csv
+    import json
+
+    (tmp_path / "day_by_symbol").mkdir()
+    # Selection must use the mapped source filename, not the local spelling.
+    (tmp_path / "day_by_symbol" / "LOCAL_day.csv").touch()
+    (tmp_path / "filename-map.json").write_text(json.dumps([
+        {"local_name": "day_by_symbol/LOCAL_day.csv", "original_name": f"day_by_symbol/{symbol}_day.csv"}
+    ]))
+    rows = [
+        {"symbol": symbol, "status": "active", "delisted_at": "", "figi": active_figi},
+        {"symbol": symbol, "status": "renamed", "delisted_at": "", "figi": renamed_figi},
+        {"symbol": symbol, "status": "delisted", "delisted_at": "2020-01-02", "figi": "OLDER"},
+    ]
+    with (tmp_path / "symbols.csv").open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(list(reversed(rows)) if reverse else rows)
+    lc, = build_lifecycles(tmp_path)
+    assert lc.source_security_key == f"FIGI:{active_figi}"
+    assert lc.status == "active"
+    assert lc.source_file_name == f"{symbol}_day.csv"
+    assert lc.local_file_name == "LOCAL_day.csv"
+
+
+@pytest.mark.parametrize("delisted", [None, "2020-01-02"])
+def test_equally_matching_lifecycle_rows_are_explicitly_ambiguous(tmp_path, delisted):
+    import csv
+
+    name = "TEST_day" + (f"_delisted_{delisted}" if delisted else "") + ".csv"
+    (tmp_path / "day_by_symbol").mkdir()
+    (tmp_path / "day_by_symbol" / name).touch()
+    rows = [{"symbol": "TEST", "delisted_at": delisted or "", "status": "delisted" if delisted else "active", "figi": figi}
+            for figi in ("FIRST", "SECOND")]
+    with (tmp_path / "symbols.csv").open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    with pytest.raises(ValueError, match="Ambiguous symbols.csv") as exc:
+        build_lifecycles(tmp_path)
+    assert name in str(exc.value)
+    assert "FIRST" in str(exc.value) and "SECOND" in str(exc.value)
+    assert '"symbols_csv_line": 2' in str(exc.value)
+    assert '"symbols_csv_line": 3' in str(exc.value)
+
+
+def test_delisted_lifecycle_uses_exact_date_and_status(tmp_path):
+    (tmp_path / "day_by_symbol").mkdir()
+    (tmp_path / "day_by_symbol" / "TEST_day_delisted_2020-01-02.csv").touch()
+    (tmp_path / "symbols.csv").write_text(
+        "symbol,delisted_at,status,figi\n"
+        "TEST,,active,CURRENT\n"
+        "TEST,2020-01-02,delisted,CORRECT\n"
+        "TEST,2020-01-02,renamed,WRONG_STATUS\n"
+        "TEST,2019-01-02,delisted,WRONG_DATE\n"
+    )
+    lc, = build_lifecycles(tmp_path)
+    assert lc.source_security_key == "FIGI:CORRECT"
