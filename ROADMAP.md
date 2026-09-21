@@ -26,7 +26,7 @@ It should eventually be easy enough for non-technical users to use through a web
 # Current priorities
 
 ## 1. Finish full historical equity ingestion
-Status: IN PROGRESS
+Status: COMPLETE — ingestion and bounded research access
 
 Completed:
 
@@ -36,11 +36,20 @@ Completed:
 - lifecycle matching, ticker-history validation, and safe retries
 - ambiguous identities excluded from research
 
-Remaining:
+- shared-FIGI histories with conflicting overlapping prices quarantined
+- full ingestion READY / SUCCEEDED with zero FAIL quality checks
+- bounded `load_research_frame()` access: SQL filtering and labels, security-ID
+  narrowing before feature joins, and a configurable 100,000-row default guard
+- ticker changes/reuse and date-boundary lookbacks/labels covered by regression tests
+- existing-warehouse smoke: AAPL in 2025, labels enabled, 250 rows in 0.549 seconds
+  (~279 MiB process peak RSS); no re-ingestion
 
-- quarantine shared-FIGI histories with conflicting overlapping prices
-- rerun ingestion to READY
-- validate `load_research_frame()` at full scale
+Remaining limits:
+
+- Full-archive pandas materialization is intentionally guarded, not validated.
+- Broad requests may still scan large amounts of data and spill to disk; the
+  2 GB DuckDB working-memory cap does not bound total process memory.
+- Keep requests bounded on the 16 GB Mac. See STATUS.md for validation details.
 
 ## 2. First real investment hypothesis
 Status: NEXT
@@ -193,15 +202,17 @@ Potential sources:
 
 At the start of every Jane session:
 
-1. Read this roadmap.
-2. Check Git branch and `git status`.
+1. Read AGENTS.md, STATUS.md, and this roadmap.
+2. Check Git branch and `git status`; preserve unrelated pre-existing changes.
 3. Review the most recently merged work.
-4. Identify the current roadmap item.
-5. Choose one small coherent change.
-6. Work locally → test → inspect diff → commit → push → PR.
+4. Identify the current roadmap item and the task agreed with Boris.
+5. Implement only that task, run relevant validation, and inspect the diff.
+6. Report changes, tests, and limitations; stop for Boris's review. Follow AGENTS.md:
+   no commit without explicit instruction; Boris performs GitHub pushes himself.
 7. Update this roadmap when priorities change.
 
 # Immediate next step
 
-Quarantine shared-FIGI price conflicts, rerun full ingestion to READY,
-then validate the research frame and start the first real hypothesis.
+The bounded research-loader task is completed and accepted. No re-ingestion is needed.
+The first real hypothesis remains the next research priority, subject to a separate
+agreed task; do not start it automatically.

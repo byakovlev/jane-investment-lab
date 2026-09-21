@@ -4,12 +4,14 @@
 Build a local-first system for discovering, testing, and accumulating statistically sound investment features and strategies.
 
 ## Roadmap
-Priority 1 — full historical equity ingestion: essentially complete.
-Priority 2 — first real investment hypothesis: next.
+Priority 1 — full historical equity ingestion and bounded research access: complete.
+Priority 2 — first real investment hypothesis: pending a separately agreed task.
 
 ## Current dataset
 Version: 2026-09-18-full
 dataset_version_id: 9135704803770303588
+Dataset status: READY
+Latest ingestion: SUCCEEDED, with zero FAIL quality checks
 Source files: 39,029
 Raw rows: 49,649,367
 Research rows: 49,209,448
@@ -66,13 +68,44 @@ Do not interpret ingestion summary `"securities": 39029` as unique securities; i
 
 Latest test count before final ingestion: 56 passed.
 
-## Immediate checks
-Confirm:
-1. dataset version status = READY
-2. latest ingestion has zero FAIL quality checks
-3. `load_research_frame()` works successfully at full scale
+## Latest task — bounded research loader
 
-Then mark Roadmap Priority 1 COMPLETE.
+`load_research_frame()` memory-usage fix completed and accepted by Boris.
+The previous unrestricted full-dataframe validation was interrupted after excessive
+swapping. The loader now filters and computes optional forward labels in SQL,
+selects candidate security IDs before ticker resolution and feature joins, and
+preserves complete selected-security histories for lookbacks and future outcomes.
+
+The configurable `max_rows` guard defaults to 100,000. Oversized requests fail
+before pandas materialization; returned results are never silently truncated.
+DuckDB working memory is capped at 2 GB, with two threads and temporary disk spill.
+Only the final requested columns and rows reach pandas.
+
+Verified against the existing warehouse without re-ingestion:
+
+- Dataset remains READY; latest ingestion SUCCEEDED with zero FAIL quality checks.
+- Bounded smoke request: AAPL, 2025-01-01 through 2025-12-31, labels enabled,
+  `max_rows=1000` returned 250 rows in 0.549 seconds.
+- Result dataframe: 83,132 bytes; process peak RSS: 292,323,328 bytes (~279 MiB).
+- The final 2025-12-31 observation retains its 21-observation forward outcome.
+- Validation: 70 relevant tests passed (`test_research_frame.py`,
+  `test_research_integration.py`, and `test_ingestion_integration.py`);
+  `py_compile` and `git diff --check` passed.
+- Regression coverage compares filtered results with small unfiltered fixture
+  slices, with and without labels, across ticker changes/reuse, date boundaries,
+  missing adjusted values, empty results, and guard rejection before pandas.
+
+Remaining limits:
+
+- Unrestricted full-archive pandas loading is intentionally guarded, not validated.
+- Broad requests can still scan substantial Parquet data, compute complete
+  selected-security histories, and require temporary disk space. The 2 GB setting
+  limits DuckDB working memory, not total process RSS or pandas allocations.
+- Increasing `max_rows` increases pandas memory requirements. This Mac has 16 GB RAM;
+  continue to use bounded requests and SQL summaries for large-data validation.
+- The smoke timing is one local measurement, not a cold-cache performance guarantee.
+
+No re-ingestion is needed. Await a separately agreed task; do not begin research automatically.
 
 ## Next research task
 First real hypothesis:
@@ -91,7 +124,10 @@ Missing data to acquire later:
 - analyst expectations if using earnings surprise
 
 ## Session workflow
-At start:
-1. Read ROADMAP.md and STATUS.md.
-2. Check branch + git status.
-3. Continue from Immediate checks / Next research task.
+
+Follow the collaboration workflow in [AGENTS.md](AGENTS.md).
+
+At start, read AGENTS.md, ROADMAP.md, and STATUS.md; check the branch and working
+tree. Implement only the agreed task, validate it, report the results and
+limitations, and stop for Boris's review. The next task above is recorded for
+planning; it is not authorization to start it automatically.
