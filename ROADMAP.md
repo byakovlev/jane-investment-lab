@@ -19,20 +19,28 @@ It should eventually be easy enough for non-technical users to use through a web
 - Control for repeated hypothesis testing
 - Research engine independent of notebook, UI, and user
 - Purchased data remains local/server-side and outside GitHub
+- Preserve raw data; quarantine ambiguous research data
 
 ---
 
 # Current priorities
 
-## 1. Ingest full historical equity dataset
-Status: NEXT
+## 1. Finish full historical equity ingestion
+Status: IN PROGRESS
 
-- inspect purchased vendor package
-- validate files
-- ingest active + delisted securities
-- validate ticker histories and corporate actions
-- run quality checks
-- test `load_research_frame()` at full scale
+Completed:
+
+- verified the full vendor archive (~49.65M daily rows)
+- canonical Parquet + DuckDB for active + delisted securities
+- raw data preserved; invalid adjusted histories quarantined
+- lifecycle matching, ticker-history validation, and safe retries
+- ambiguous identities excluded from research
+
+Remaining:
+
+- quarantine shared-FIGI histories with conflicting overlapping prices
+- rerun ingestion to READY
+- validate `load_research_frame()` at full scale
 
 ## 2. First real investment hypothesis
 Status: NEXT
@@ -195,6 +203,5 @@ At the start of every Jane session:
 
 # Immediate next step
 
-Inspect and ingest the full historical equity dataset.
-
-Then obtain the point-in-time data required for the first real investment hypothesis.
+Quarantine shared-FIGI price conflicts, rerun full ingestion to READY,
+then validate the research frame and start the first real hypothesis.
