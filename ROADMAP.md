@@ -19,20 +19,37 @@ It should eventually be easy enough for non-technical users to use through a web
 - Control for repeated hypothesis testing
 - Research engine independent of notebook, UI, and user
 - Purchased data remains local/server-side and outside GitHub
+- Preserve raw data; quarantine ambiguous research data
 
 ---
 
 # Current priorities
 
-## 1. Ingest full historical equity dataset
-Status: NEXT
+## 1. Finish full historical equity ingestion
+Status: COMPLETE — ingestion and bounded research access
 
-- inspect purchased vendor package
-- validate files
-- ingest active + delisted securities
-- validate ticker histories and corporate actions
-- run quality checks
-- test `load_research_frame()` at full scale
+Completed:
+
+- verified the full vendor archive (~49.65M daily rows)
+- canonical Parquet + DuckDB for active + delisted securities
+- raw data preserved; invalid adjusted histories quarantined
+- lifecycle matching, ticker-history validation, and safe retries
+- ambiguous identities excluded from research
+
+- shared-FIGI histories with conflicting overlapping prices quarantined
+- full ingestion READY / SUCCEEDED with zero FAIL quality checks
+- bounded `load_research_frame()` access: SQL filtering and labels, security-ID
+  narrowing before feature joins, and a configurable 100,000-row default guard
+- ticker changes/reuse and date-boundary lookbacks/labels covered by regression tests
+- existing-warehouse smoke: AAPL in 2025, labels enabled, 250 rows in 0.549 seconds
+  (~279 MiB process peak RSS); no re-ingestion
+
+Remaining limits:
+
+- Full-archive pandas materialization is intentionally guarded, not validated.
+- Broad requests may still scan large amounts of data and spill to disk; the
+  2 GB DuckDB working-memory cap does not bound total process memory.
+- Keep requests bounded on the 16 GB Mac. See STATUS.md for validation details.
 
 ## 2. First real investment hypothesis
 Status: NEXT
@@ -185,16 +202,17 @@ Potential sources:
 
 At the start of every Jane session:
 
-1. Read this roadmap.
-2. Check Git branch and `git status`.
+1. Read AGENTS.md, STATUS.md, and this roadmap.
+2. Check Git branch and `git status`; preserve unrelated pre-existing changes.
 3. Review the most recently merged work.
-4. Identify the current roadmap item.
-5. Choose one small coherent change.
-6. Work locally → test → inspect diff → commit → push → PR.
+4. Identify the current roadmap item and the task agreed with Boris.
+5. Implement only that task, run relevant validation, and inspect the diff.
+6. Report changes, tests, and limitations; stop for Boris's review. Follow AGENTS.md:
+   no commit without explicit instruction; Boris performs GitHub pushes himself.
 7. Update this roadmap when priorities change.
 
 # Immediate next step
 
-Inspect and ingest the full historical equity dataset.
-
-Then obtain the point-in-time data required for the first real investment hypothesis.
+The bounded research-loader task is completed and accepted. No re-ingestion is needed.
+The first real hypothesis remains the next research priority, subject to a separate
+agreed task; do not start it automatically.

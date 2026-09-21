@@ -196,3 +196,13 @@ CREATE TABLE IF NOT EXISTS experiment_metric (
     metric_json JSON,
     PRIMARY KEY (experiment_id, metric_name)
 );
+
+
+-- Version-scoped identity exceptions: retain source bars but prevent research use.
+CREATE TABLE IF NOT EXISTS identity_history_quarantine (
+    dataset_version_id BIGINT NOT NULL REFERENCES dataset_version(dataset_version_id),
+    security_id BIGINT NOT NULL,
+    ingestion_run_id BIGINT NOT NULL REFERENCES ingestion_run(ingestion_run_id),
+    details_json JSON NOT NULL,
+    PRIMARY KEY (dataset_version_id, security_id)
+);

@@ -4,7 +4,7 @@ import csv
 import json
 import shutil
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -18,9 +18,11 @@ from investment_lab.providers.historicaldata_net import (
     parse_symbol_history,
     source_fingerprint,
     verify_vendor_delivery,
+    classify_verifier_failures,
+    load_filename_map,
 )
 
-PIPELINE_VERSION = "investment-lab-v0.2"
+PIPELINE_VERSION = "investment-lab-v0.3"
 DATASET_ID = stable_bigint("dataset", "historicaldata.net|US_EQUITIES|DAILY")
 
 DAY_COLUMNS_SQL = """{
@@ -44,9 +46,23 @@ def _sql_path(path: Path) -> str:
 def _write_lifecycle_map(path: Path, lifecycles) -> None:
     with path.open("w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["source_file_name", "security_id", "source_security_key", "terminal_symbol", "delisted_at"])
+        w.writerow([
+            "local_file_name",
+            "source_file_name",
+            "security_id",
+            "source_security_key",
+            "terminal_symbol",
+            "delisted_at",
+        ])
         for lc in lifecycles:
-            w.writerow([lc.source_file_name, lc.security_id, lc.source_security_key, lc.terminal_symbol, lc.delisted_at or ""])
+            w.writerow([
+                lc.local_file_name,
+                lc.source_file_name,
+                lc.security_id,
+                lc.source_security_key,
+                lc.terminal_symbol,
+                lc.delisted_at or "",
+            ])
 
 
 def _record_check(con, run_id: int, name: str, status: str, observed=None, expected=None, severity="ERROR", details=None):
@@ -58,6 +74,162 @@ def _record_check(con, run_id: int, name: str, status: str, observed=None, expec
          None if expected is None else str(expected),
          json.dumps(details) if details is not None else None],
     )
+
+
+def _validated_ticker_history(con, run_id, lifecycles, stats):
+    """Deduplicate intervals and quarantine conflicting securities before inserts."""
+    by_key = {}
+    conflicts = []
+    duplicates = 0
+    for lc in lifecycles:
+        provenance = {
+            "local_file_name": lc.local_file_name,
+            "source_file_name": lc.source_file_name,
+            "source_security_key": lc.source_security_key,
+            "symbol_history": lc.symbol_history,
+        }
+        s = stats[lc.local_file_name]
+        # Malformed history is a structural failure, not an identity exception.
+        intervals = parse_symbol_history(lc, s["first"], s["last"])
+        for symbol, start, end in intervals:
+            if not symbol.strip():
+                raise ValueError(f"Empty ticker in {lc.source_file_name}")
+            date.fromisoformat(start)
+            if end is not None:
+                date.fromisoformat(end)
+            candidate = {"symbol": symbol, "valid_from": start, "valid_to": end, **provenance}
+            key = (lc.security_id, start)
+            previous = by_key.get(key)
+            if previous is not None:
+                if (previous["symbol"], previous["valid_to"]) == (symbol, end):
+                    duplicates += 1
+                else:
+                    conflicts.append({
+                        "security_id": lc.security_id,
+                        "valid_from": start,
+                        "reason": "Different ticker or valid_to for the same security and valid_from",
+                        "intervals": [previous, candidate],
+                    })
+            else:
+                by_key[key] = candidate
+            if end is not None and end < start:
+                conflicts.append({
+                    "security_id": lc.security_id, "reason": "valid_to precedes valid_from",
+                    "intervals": [candidate],
+                })
+
+    quarantined_ids = {conflict["security_id"] for conflict in conflicts}
+    quarantines = []
+    for security_id in sorted(quarantined_ids):
+        sources = [lc for lc in lifecycles if lc.security_id == security_id]
+        quarantines.append({
+            "security_id": security_id,
+            "source_files": [
+                {"local_file_name": lc.local_file_name, "source_file_name": lc.source_file_name,
+                 "symbol_history": lc.symbol_history, "source_security_key": lc.source_security_key,
+                 "rows": stats[lc.local_file_name]["rows"]}
+                for lc in sources
+            ],
+            "conflicts": [c for c in conflicts if c["security_id"] == security_id],
+        })
+    _record_check(
+        con, run_id, "ticker_history_consistency", "SKIP" if conflicts else "PASS",
+        observed=len(conflicts), expected=0,
+        severity="WARNING" if conflicts else "INFO",
+        details={"exact_duplicates_deduplicated": duplicates, "conflicts": conflicts,
+                 "quarantined_securities": quarantines},
+    )
+    return [
+        (security_id, item["symbol"], start, item["valid_to"])
+        for (security_id, start), item in by_key.items()
+        if security_id not in quarantined_ids
+    ], quarantines
+
+
+def _quarantine_raw_conflicts(con, run_id, lifecycles, stats, ticker_quarantines):
+    """Quarantine securities with conflicting market observations across files.
+
+    Compare values directly (including NULLs), not hashes containing filenames.
+    Restrict the scan to securities represented by multiple source files.
+    """
+    con.execute("""CREATE OR REPLACE TEMP TABLE _conflicting_raw_dates AS
+        SELECT m.security_id, v.date AS trade_date, count(*) AS row_count,
+               list(DISTINCT m.source_file_name ORDER BY m.source_file_name) AS source_files
+        FROM _vendor_daily v JOIN _lifecycle_map m USING (local_file_name)
+        WHERE m.security_id IN (
+            SELECT security_id FROM _lifecycle_map GROUP BY 1
+            HAVING count(DISTINCT local_file_name) > 1
+        )
+        GROUP BY 1,2
+        HAVING count(DISTINCT v.local_file_name) > 1
+           AND count(DISTINCT (v.open, v.high, v.low, v.close,
+                              v.volume, v.vwap, v.transactions)) > 1
+    """)
+    conflicts = con.execute("""
+        SELECT security_id, count(*), sum(row_count), min(trade_date), max(trade_date)
+        FROM _conflicting_raw_dates GROUP BY 1 ORDER BY 1
+    """).fetchall()
+    conflicting_files = dict(con.execute("""
+        SELECT security_id, list(DISTINCT source_file ORDER BY source_file)
+        FROM _conflicting_raw_dates, UNNEST(source_files) AS f(source_file)
+        GROUP BY 1
+    """).fetchall())
+    quarantines = {q["security_id"]: q for q in ticker_quarantines}
+    for q in quarantines.values():
+        q["reasons"] = ["ticker_history_conflict"]
+    for security_id, dates, rows, first, last in conflicts:
+        if security_id not in quarantines:
+            quarantines[security_id] = {
+                "security_id": security_id,
+                "source_files": [
+                    {"local_file_name": lc.local_file_name, "source_file_name": lc.source_file_name,
+                     "symbol_history": lc.symbol_history, "source_security_key": lc.source_security_key,
+                     "rows": stats[lc.local_file_name]["rows"]}
+                    for lc in lifecycles if lc.security_id == security_id
+                ],
+                "conflicts": [], "reasons": [],
+            }
+        q = quarantines[security_id]
+        q["reasons"].append("conflicting_raw_observations")
+        q["raw_observation_conflict"] = {
+            "conflicting_date_count": dates,
+            "rows_on_conflicting_dates": rows,
+            "first_conflicting_date": str(first), "last_conflicting_date": str(last),
+            "source_files": conflicting_files[security_id],
+            "compared_fields": ["open", "high", "low", "close", "volume", "vwap", "transactions"],
+        }
+    for q in quarantines.values():
+        q["file_count"] = len(q["source_files"])
+        q["row_count"] = sum(f["rows"] for f in q["source_files"])
+    price_quarantines = [quarantines[sid] for sid, *_ in conflicts]
+    counts = {
+        "raw_conflict_quarantined_securities": len(price_quarantines),
+        "raw_conflict_quarantined_files": sum(q["file_count"] for q in price_quarantines),
+        "raw_conflict_quarantined_rows": sum(q["row_count"] for q in price_quarantines),
+        "raw_conflicting_date_pairs": sum(dates for _, dates, *_ in conflicts),
+        "raw_rows_on_conflicting_dates": sum(rows for _, _, rows, *_ in conflicts),
+    }
+    for name, count in counts.items():
+        _record_check(con, run_id, name, "SKIP" if count else "PASS", count, 0,
+                      severity="WARNING" if count else "INFO")
+    return list(quarantines.values()), counts
+
+
+def _create_current_views(con, raw_root, adjusted_root):
+    # Keep the full raw archive available for provenance, including identity quarantine.
+    con.execute(f"CREATE OR REPLACE VIEW bars_daily_raw_current AS SELECT * FROM read_parquet('{_sql_path(raw_root)}/**/*.parquet', hive_partitioning=true)")
+    for name, source in (
+        ("bars_daily_current", "bars_daily_raw_current"),
+        ("vendor_adjusted_daily_current", f"read_parquet('{_sql_path(adjusted_root)}/**/*.parquet', hive_partitioning=true)"),
+    ):
+        con.execute(f"""CREATE OR REPLACE VIEW {name} AS
+            SELECT r.* FROM {source} r
+            WHERE NOT EXISTS (
+                SELECT 1 FROM identity_history_quarantine q
+                WHERE q.dataset_version_id = r.source_dataset_version_id
+                  AND q.security_id = r.security_id
+            )
+        """)
 
 
 def ingest_historicaldata_net(
@@ -76,40 +248,72 @@ def ingest_historicaldata_net(
     con.execute((project_root / "schema" / "001_core.sql").read_text())
 
     fingerprint = source_fingerprint(source_root)
-    dataset_version_id = stable_bigint("dataset_version", f"{DATASET_ID}|{fingerprint}|{PIPELINE_VERSION}")
-    run_id = stable_bigint("ingestion_run", f"{dataset_version_id}|{PIPELINE_VERSION}")
-    canonical_root = warehouse / "canonical" / "historicaldata_net" / f"dataset_version={dataset_version_id}"
-    raw_root = canonical_root / "bars_daily_raw"
-    adjusted_root = canonical_root / "bars_daily_vendor_adjusted"
-
     con.execute(
         """INSERT OR IGNORE INTO dataset VALUES (?, ?, ?, ?, ?, ?, ?)""",
         [DATASET_ID, "HistoricalData.net US equities daily", PROVIDER, "EQUITY", "DAILY",
          "Vendor daily US equity archive; raw bars plus separately preserved archive-adjusted bars.", _now()],
     )
 
+    # A label identifies a source delivery, independently of the implementation
+    # that attempted to ingest it. Resolve it before changing any derived state.
     existing = con.execute(
-        "SELECT status FROM dataset_version WHERE dataset_version_id=?", [dataset_version_id]
+        """SELECT dataset_version_id, status, source_fingerprint_sha256, pipeline_version,
+                  canonical_raw_uri, canonical_adjusted_uri
+           FROM dataset_version WHERE dataset_id=? AND version_label=?""",
+        [DATASET_ID, version_label],
     ).fetchone()
-    if existing and existing[0] == "READY" and raw_root.exists() and adjusted_root.exists():
-        con.execute("DROP VIEW IF EXISTS bars_daily_current")
-        con.execute("DROP VIEW IF EXISTS vendor_adjusted_daily_current")
-        con.execute(f"CREATE VIEW bars_daily_current AS SELECT * FROM read_parquet('{_sql_path(raw_root)}/**/*.parquet', hive_partitioning=true)")
-        con.execute(f"CREATE VIEW vendor_adjusted_daily_current AS SELECT * FROM read_parquet('{_sql_path(adjusted_root)}/**/*.parquet', hive_partitioning=true)")
-        row = con.execute(
-            "SELECT summary_json FROM ingestion_run WHERE dataset_version_id=? AND status='SUCCEEDED' ORDER BY finished_at DESC LIMIT 1",
-            [dataset_version_id],
-        ).fetchone()
-        summary = row[0] if row else None
-        con.close()
-        if isinstance(summary, str):
-            return json.loads(summary)
-        return summary or {"dataset_version_id": dataset_version_id, "status": "READY"}
+    if existing:
+        dataset_version_id, status, stored_fingerprint, stored_pipeline, raw_uri, adjusted_uri = existing
+        if stored_fingerprint != fingerprint:
+            con.close()
+            raise RuntimeError(
+                f"Dataset label {version_label!r} already exists with a different source fingerprint: "
+                f"stored={stored_fingerprint}, requested={fingerprint}; use a different label."
+            )
+        if status == "READY":
+            if stored_pipeline != PIPELINE_VERSION:
+                con.close()
+                raise RuntimeError(
+                    f"Dataset label {version_label!r} is already READY under {stored_pipeline}; "
+                    f"cannot rebuild it with {PIPELINE_VERSION}. Use a different label."
+                )
+            raw_root = Path(raw_uri) if raw_uri else None
+            adjusted_root = Path(adjusted_uri) if adjusted_uri else None
+            if not (raw_root and adjusted_root and any(raw_root.rglob("*.parquet"))
+                    and any(adjusted_root.rglob("*.parquet"))):
+                con.close()
+                raise RuntimeError(
+                    f"Dataset label {version_label!r} is already READY but canonical files are missing; "
+                    "refusing to overwrite it."
+                )
+            _create_current_views(con, raw_root, adjusted_root)
+            row = con.execute(
+                "SELECT summary_json FROM ingestion_run WHERE dataset_version_id=? AND status='SUCCEEDED' ORDER BY finished_at DESC LIMIT 1",
+                [dataset_version_id],
+            ).fetchone()
+            summary = row[0] if row else None
+            con.close()
+            if isinstance(summary, str):
+                return json.loads(summary)
+            return summary or {"dataset_version_id": dataset_version_id, "status": "READY"}
+        if status not in {"REJECTED", "INGESTING"}:
+            con.close()
+            raise RuntimeError(f"Dataset label {version_label!r} has status {status}; cannot retry it.")
+    else:
+        dataset_version_id = stable_bigint("dataset_version", f"{DATASET_ID}|{version_label}|{fingerprint}")
 
-    # Re-running a failed/incomplete copy is safe: derived rows for this exact dataset/pipeline
-    # version are cleared, while the immutable dataset_version identity remains stable.
-    con.execute("DELETE FROM quality_check_result WHERE ingestion_run_id=?", [run_id])
-    con.execute("DELETE FROM ingestion_run WHERE ingestion_run_id=?", [run_id])
+    # Preserve previous attempts and their quality diagnostics as provenance.
+    # Each retry gets a fresh run; the source version and stable identities persist.
+    run_id = stable_bigint("ingestion_run", f"{dataset_version_id}|{PIPELINE_VERSION}|{_now()}")
+    canonical_root = warehouse / "canonical" / "historicaldata_net" / f"dataset_version={dataset_version_id}"
+    raw_root = canonical_root / "bars_daily_raw"
+    adjusted_root = canonical_root / "bars_daily_vendor_adjusted"
+    con.execute(
+        """UPDATE ingestion_run SET status='FAILED', finished_at=?
+           WHERE dataset_version_id=? AND status='RUNNING'""",
+        [_now(), dataset_version_id],
+    )
+    con.execute("DELETE FROM identity_history_quarantine WHERE dataset_version_id=?", [dataset_version_id])
     con.execute("DELETE FROM corporate_action WHERE source_dataset_version_id=?", [dataset_version_id])
     con.execute("DELETE FROM source_file WHERE dataset_version_id=?", [dataset_version_id])
     con.execute("DELETE FROM security_identifier_history WHERE source_dataset_version_id=?", [dataset_version_id])
@@ -122,10 +326,10 @@ def ingest_historicaldata_net(
 
     if existing:
         con.execute(
-            """UPDATE dataset_version SET version_label=?, source_asof=?, retrieved_at=?, raw_uri=?,
-               source_fingerprint_sha256=?, canonical_raw_uri=?, canonical_adjusted_uri=?, row_count=NULL,
+            """UPDATE dataset_version SET source_asof=coalesce(?, source_asof), retrieved_at=?, raw_uri=?,
+               canonical_raw_uri=?, canonical_adjusted_uri=?, row_count=NULL,
                status='INGESTING', pipeline_version=?, notes=? WHERE dataset_version_id=?""",
-            [version_label, source_asof, _now(), str(source_root), fingerprint, str(raw_root), str(adjusted_root),
+            [source_asof, _now(), str(source_root), str(raw_root), str(adjusted_root),
              PIPELINE_VERSION, "HistoricalData.net delivery ingested without altering source files.", dataset_version_id],
         )
     else:
@@ -146,42 +350,146 @@ def ingest_historicaldata_net(
     )
 
     # Vendor-native verification. The free sample is an extract, the full package is not.
-    verified, verify_output = verify_vendor_delivery(source_root, extract=extract_sample)
-    _record_check(con, run_id, "vendor_verify_py", "PASS" if verified else "FAIL",
-                  observed="exit=0" if verified else "nonzero", expected="exit=0",
-                  details={"tail": verify_output[-4000:]})
-    if not verified:
-        con.execute("UPDATE dataset_version SET status='REJECTED' WHERE dataset_version_id=?", [dataset_version_id])
-        con.execute("UPDATE ingestion_run SET status='FAILED', finished_at=? WHERE ingestion_run_id=?", [_now(), run_id])
-        raise RuntimeError("Vendor verification failed; see quality_check_result")
-
+    verified, verify_output = verify_vendor_delivery(
+        source_root,
+        extract=extract_sample,
+    )
+    
+    adjustment_failures: set[str] = set()
+    
+    if verified:
+        _record_check(
+            con,
+            run_id,
+            "vendor_verify_py",
+            "PASS",
+            observed="exit=0",
+            expected="exit=0",
+        )
+    else:
+        adjustment_failures, manifest_missing, other_failures = (
+            classify_verifier_failures(verify_output)
+        )
+    
+        filename_map = load_filename_map(source_root)
+    
+        mapped_originals = {
+            Path(original).name
+            for local, original in filename_map.items()
+            if (source_root / local).exists()
+        }
+    
+        unexplained_missing = manifest_missing - mapped_originals
+    
+        if other_failures or unexplained_missing or not (adjustment_failures or manifest_missing):
+            _record_check(
+                con,
+                run_id,
+                "vendor_verify_py",
+                "FAIL",
+                observed="unexplained verification failures",
+                expected="only known filename mappings or adjustment failures",
+                details={
+                    "adjustment_failures": sorted(adjustment_failures),
+                    "mapped_manifest_exceptions": sorted(
+                        manifest_missing - unexplained_missing
+                    ),
+                    "unexplained_missing": sorted(unexplained_missing),
+                    "other_failures": other_failures,
+                },
+            )
+            con.execute(
+                "UPDATE dataset_version SET status='REJECTED' WHERE dataset_version_id=?",
+                [dataset_version_id],
+            )
+            con.execute(
+                "UPDATE ingestion_run SET status='FAILED', finished_at=? WHERE ingestion_run_id=?",
+                [_now(), run_id],
+            )
+            raise RuntimeError(
+                "Vendor verification contains unexplained failures; "
+                "see quality_check_result"
+            )
+    
+        _record_check(
+            con,
+            run_id,
+            "vendor_verify_py",
+            "SKIP",
+            observed=(
+                f"{len(adjustment_failures)} adjustment failures; "
+                f"{len(manifest_missing)} mapped filename exceptions"
+            ),
+            expected="exit=0 or understood exceptions only",
+            severity="WARNING",
+            details={
+                "adjustment_failures": sorted(adjustment_failures),
+                "mapped_manifest_exceptions": sorted(manifest_missing),
+            },
+        )
+        
     lifecycles = build_lifecycles(source_root)
     if not lifecycles:
         raise RuntimeError("No security lifecycles resolved")
+
+    # Verifier names may refer to the local file or its original vendor name.
+    failed_names = {Path(name.replace("\\", "/")).name for name in adjustment_failures}
+    quarantined_lifecycles = [
+        lc for lc in lifecycles
+        if lc.local_file_name in failed_names or lc.source_file_name in failed_names
+    ]
+    con.execute(
+        "CREATE OR REPLACE TEMP TABLE _adjustment_quarantine "
+        "(source_file_name VARCHAR)"
+    )
+    if quarantined_lifecycles:
+        con.executemany(
+            "INSERT INTO _adjustment_quarantine VALUES (?)",
+            [(lc.source_file_name,) for lc in quarantined_lifecycles],
+        )
 
     # One pass over all daily files with the vendor's fixed schema.
     glob = _sql_path(source_root / "day_by_symbol" / "*.csv")
     con.execute("DROP VIEW IF EXISTS _vendor_daily")
     con.execute(f"""
         CREATE TEMP VIEW _vendor_daily AS
-        SELECT *, regexp_extract(filename, '[^/\\\\]+$') AS source_file_name
+        SELECT *, regexp_extract(filename, '[^/\\\\]+$') AS local_file_name
         FROM read_csv('{glob}', header=true, columns={DAY_COLUMNS_SQL}, filename=true, nullstr='')
     """)
     stats = {row[0]: {"first": str(row[1]), "last": str(row[2]), "rows": row[3]}
              for row in con.execute("""
-                 SELECT source_file_name, min(date), max(date), count(*)
+                 SELECT local_file_name, min(date), max(date), count(*)
                  FROM _vendor_daily GROUP BY 1
              """).fetchall()}
 
     temp_map = Path(tempfile.mkstemp(prefix="lifecycle_map_", suffix=".csv")[1])
     try:
+        ticker_history, identity_quarantines = _validated_ticker_history(con, run_id, lifecycles, stats)
         _write_lifecycle_map(temp_map, lifecycles)
         con.execute("DROP TABLE IF EXISTS _lifecycle_map")
         con.execute(f"CREATE TEMP TABLE _lifecycle_map AS SELECT * FROM read_csv_auto('{_sql_path(temp_map)}', header=true)")
+        identity_quarantines, raw_conflict_counts = _quarantine_raw_conflicts(
+            con, run_id, lifecycles, stats, identity_quarantines,
+        )
+        identity_ids = {q["security_id"] for q in identity_quarantines}
+        identity_files = sum(len(q["source_files"]) for q in identity_quarantines)
+        identity_rows = sum(f["rows"] for q in identity_quarantines for f in q["source_files"])
+        for q in identity_quarantines:
+            con.execute(
+                "INSERT INTO identity_history_quarantine VALUES (?, ?, ?, ?)",
+                [dataset_version_id, q["security_id"], run_id, json.dumps(q)],
+            )
+        for name, count in (
+            ("identity_quarantined_securities", len(identity_ids)),
+            ("identity_quarantined_files", identity_files),
+            ("identity_quarantined_rows", identity_rows),
+        ):
+            _record_check(con, run_id, name, "SKIP" if count else "PASS", count, 0,
+                          severity="WARNING" if count else "INFO")
 
         # Replace only the source lifecycle rows represented by this immutable dataset version.
         for lc in lifecycles:
-            s = stats.get(lc.source_file_name)
+            s = stats.get(lc.local_file_name)
             if not s:
                 raise RuntimeError(f"No data stats for {lc.source_file_name}")
             first_date, last_date = s["first"], s["last"]
@@ -218,16 +526,21 @@ def ingest_historicaldata_net(
                  lc.name, lc.instrument_type, lc.exchange, lc.status, lc.delisted_at, lc.cik, lc.figi,
                  json.dumps({"symbol_history": lc.symbol_history, "source_file_name": lc.source_file_name})],
             )
-            for symbol, start, end in parse_symbol_history(lc, first_date, last_date):
-                con.execute(
-                    "INSERT INTO security_identifier_history VALUES (?, 'TICKER', ?, 'US_EQUITY', ?, ?, ?)",
-                    [lc.security_id, symbol, start, end, dataset_version_id],
-                )
+        for security_id, symbol, start, end in ticker_history:
+            if security_id in identity_ids:
+                continue
+            con.execute(
+                "INSERT INTO security_identifier_history VALUES (?, 'TICKER', ?, 'US_EQUITY', ?, ?, ?)",
+                [security_id, symbol, start, end, dataset_version_id],
+            )
 
         # Source file metadata from vendor manifests + actual daily scan.
         manifest_hashes = manifest_file_hashes(source_root)
+        lifecycle_by_local = {lc.local_file_name: lc for lc in lifecycles}
+
         for path in day_files(source_root):
-            rel = path.relative_to(source_root).as_posix()
+            lc = lifecycle_by_local[path.name]
+            rel = (Path("day_by_symbol") / lc.source_file_name).as_posix()
             s = stats[path.name]
             mbytes, msha = manifest_hashes.get(rel, (path.stat().st_size, None))
             con.execute(
@@ -243,7 +556,7 @@ def ingest_historicaldata_net(
             CREATE TEMP VIEW _raw_bars AS
             SELECT
                 m.security_id,
-                v.source_file_name,
+                m.source_file_name,
                 m.terminal_symbol AS source_symbol,
                 v.date AS trade_date,
                 year(v.date)::INTEGER AS trade_year,
@@ -252,14 +565,14 @@ def ingest_historicaldata_net(
                 'AFTER_SESSION_CLOSE'::VARCHAR AS availability_rule,
                 {dataset_version_id}::BIGINT AS source_dataset_version_id,
                 md5(concat_ws('|',
-                    v.source_file_name, cast(v.date as varchar),
+                    m.source_file_name, cast(v.date as varchar),
                     coalesce(cast(v.open as varchar),'<NULL>'), coalesce(cast(v.high as varchar),'<NULL>'),
                     coalesce(cast(v.low as varchar),'<NULL>'), coalesce(cast(v.close as varchar),'<NULL>'),
                     coalesce(cast(v.volume as varchar),'<NULL>'), coalesce(cast(v.vwap as varchar),'<NULL>'),
                     coalesce(cast(v.transactions as varchar),'<NULL>')
                 )) AS source_row_hash
             FROM _vendor_daily v
-            JOIN _lifecycle_map m USING (source_file_name)
+            JOIN _lifecycle_map m USING (local_file_name)
         """)
 
         # Vendor adjusted bars are useful for ex-post total-return math/validation, but their
@@ -269,7 +582,7 @@ def ingest_historicaldata_net(
             CREATE TEMP VIEW _adjusted_bars AS
             SELECT
                 m.security_id,
-                v.source_file_name,
+                m.source_file_name,
                 m.terminal_symbol AS source_symbol,
                 v.date AS trade_date,
                 year(v.date)::INTEGER AS trade_year,
@@ -277,21 +590,45 @@ def ingest_historicaldata_net(
                 'VENDOR_ARCHIVE_ADJUSTED_THROUGH_SNAPSHOT'::VARCHAR AS adjustment_basis,
                 {dataset_version_id}::BIGINT AS source_dataset_version_id
             FROM _vendor_daily v
-            JOIN _lifecycle_map m USING (source_file_name)
+            JOIN _lifecycle_map m USING (local_file_name)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM _adjustment_quarantine q
+                WHERE q.source_file_name = m.source_file_name
+            ) AND NOT EXISTS (
+                SELECT 1 FROM identity_history_quarantine q
+                WHERE q.security_id = m.security_id
+                  AND q.dataset_version_id = {dataset_version_id}
+            )
         """)
 
         # Stream canonical views straight to partitioned Parquet. We avoid materializing the
         # whole archive inside metadata.duckdb; the database stays a catalogue, not a warehouse.
         con.execute(f"COPY (SELECT * FROM _raw_bars) TO '{_sql_path(raw_root)}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (trade_year), OVERWRITE_OR_IGNORE)")
         con.execute(f"COPY (SELECT * FROM _adjusted_bars) TO '{_sql_path(adjusted_root)}' (FORMAT PARQUET, COMPRESSION ZSTD, PARTITION_BY (trade_year), OVERWRITE_OR_IGNORE)")
-        con.execute("DROP VIEW IF EXISTS bars_daily_current")
-        con.execute("DROP VIEW IF EXISTS vendor_adjusted_daily_current")
-        con.execute(f"CREATE VIEW bars_daily_current AS SELECT * FROM read_parquet('{_sql_path(raw_root)}/**/*.parquet', hive_partitioning=true)")
-        con.execute(f"CREATE VIEW vendor_adjusted_daily_current AS SELECT * FROM read_parquet('{_sql_path(adjusted_root)}/**/*.parquet', hive_partitioning=true)")
+        # Partitioned COPY emits no files when every adjusted history is quarantined.
+        # Preserve a readable, schema-carrying dataset for current views and reruns.
+        if not any(adjusted_root.rglob("*.parquet")):
+            con.execute(f"COPY (SELECT * FROM _adjusted_bars LIMIT 0) TO '{_sql_path(adjusted_root / 'empty.parquet')}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        _create_current_views(con, raw_root, adjusted_root)
 
         vendor_count = sum(x["rows"] for x in stats.values())
-        raw_count = con.execute("SELECT count(*) FROM bars_daily_current").fetchone()[0]
+        raw_count = con.execute("SELECT count(*) FROM bars_daily_raw_current").fetchone()[0]
         adjusted_count = con.execute("SELECT count(*) FROM vendor_adjusted_daily_current").fetchone()[0]
+        research_count = con.execute("SELECT count(*) FROM bars_daily_current").fetchone()[0]
+        # Count the union once when adjustment failures and identity quarantine overlap.
+        adjusted_excluded = {lc.local_file_name for lc in quarantined_lifecycles}
+        adjusted_excluded.update(lc.local_file_name for lc in lifecycles if lc.security_id in identity_ids)
+        adjusted_excluded_rows = sum(stats[name]["rows"] for name in adjusted_excluded)
+        quarantined_file_count = len(quarantined_lifecycles)
+        quarantined_row_count = sum(stats[lc.local_file_name]["rows"] for lc in quarantined_lifecycles)
+        for name, count in (
+            ("adjusted_quarantined_files", quarantined_file_count),
+            ("adjusted_quarantined_rows", quarantined_row_count),
+        ):
+            _record_check(
+                con, run_id, name, "SKIP" if count else "PASS", count, 0,
+                severity="WARNING" if count else "INFO",
+            )
         unresolved = vendor_count - raw_count
         duplicate_keys = con.execute("""
             SELECT count(*) FROM (
@@ -300,17 +637,27 @@ def ingest_historicaldata_net(
             )
         """).fetchone()[0]
         invalid_ohlc = con.execute("""
-            SELECT count(*) FROM bars_daily_current
+            SELECT count(*) FROM bars_daily_raw_current
             WHERE open IS NOT NULL AND (
                 low > open OR open > high OR low > close OR close > high OR
                 open <= 0 OR high <= 0 OR low <= 0 OR close <= 0
             )
         """).fetchone()[0]
-        negative_volume = con.execute("SELECT count(*) FROM bars_daily_current WHERE volume < 0").fetchone()[0]
+        negative_volume = con.execute("SELECT count(*) FROM bars_daily_raw_current WHERE volume < 0").fetchone()[0]
 
+        duplicate_source_keys = con.execute("""
+            SELECT count(*) FROM (
+                SELECT source_file_name, trade_date FROM bars_daily_raw_current
+                GROUP BY 1,2 HAVING count(*) > 1
+            )
+        """).fetchone()[0]
         checks = [
+            ("no_duplicate_source_dates", duplicate_source_keys == 0, duplicate_source_keys, 0),
+            ("research_row_count_matches_eligible", research_count == vendor_count - identity_rows,
+             research_count, vendor_count - identity_rows),
             ("canonical_row_count_matches_vendor", raw_count == vendor_count, raw_count, vendor_count),
-            ("adjusted_row_count_matches_vendor", adjusted_count == vendor_count, adjusted_count, vendor_count),
+            ("adjusted_row_count_matches_vendor", adjusted_count == vendor_count - adjusted_excluded_rows,
+             adjusted_count, vendor_count - adjusted_excluded_rows),
             ("all_files_resolved_to_security", unresolved == 0, unresolved, 0),
             ("no_duplicate_security_dates", duplicate_keys == 0, duplicate_keys, 0),
             ("ohlc_invariants", invalid_ohlc == 0, invalid_ohlc, 0),
@@ -326,8 +673,8 @@ def ingest_historicaldata_net(
         # Thus a dividend/split may be used only from its ex/effective date onward.
         con.execute("DELETE FROM corporate_action WHERE source_dataset_version_id=?", [dataset_version_id])
         action_rows = con.execute("""
-            SELECT m.security_id, v.source_file_name, v.date, v.dividend, v.dividend_type, v.split
-            FROM _vendor_daily v JOIN _lifecycle_map m USING (source_file_name)
+            SELECT m.security_id, m.source_file_name, v.date, v.dividend, v.dividend_type, v.split
+            FROM _vendor_daily v JOIN _lifecycle_map m USING (local_file_name)
             WHERE v.dividend IS NOT NULL OR v.split IS NOT NULL
             ORDER BY 1,3
         """).fetchall()
@@ -392,6 +739,14 @@ def ingest_historicaldata_net(
             "source_fingerprint_sha256": fingerprint,
             "daily_files": len(lifecycles),
             "daily_rows": raw_count,
+            "research_rows": research_count,
+            "identity_quarantined_securities": len(identity_ids),
+            "identity_quarantined_files": identity_files,
+            "identity_quarantined_rows": identity_rows,
+            **raw_conflict_counts,
+            "adjusted_rows": adjusted_count,
+            "adjusted_quarantined_files": quarantined_file_count,
+            "adjusted_quarantined_rows": quarantined_row_count,
             "securities": len(lifecycles),
             "provisional_security_metadata": provisional,
             "corporate_actions": action_count,

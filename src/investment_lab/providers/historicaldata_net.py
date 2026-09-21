@@ -30,6 +30,7 @@ class Lifecycle:
     figi: str | None
     symbol_history: str | None
     metadata_completeness: str
+    local_file_name: str
     source_file_name: str
 
 
@@ -45,6 +46,33 @@ def load_manifest(root: Path) -> dict | None:
     path = root / "manifest.json"
     return json.loads(path.read_text()) if path.exists() else None
 
+def load_filename_map(root: Path) -> dict[str, str]:
+    path = root / "filename-map.json"
+    if not path.exists():
+        return {}
+
+    payload = json.loads(path.read_text())
+    mapping: dict[str, str] = {}
+
+    def walk(obj) -> None:
+        if isinstance(obj, dict):
+            original = obj.get("original_name")
+            local = obj.get("local_name")
+
+            if original and local and obj.get("active", True):
+                local_key = str(local).replace("\\", "/")
+                original_value = str(original).replace("\\", "/")
+                mapping[local_key] = original_value
+
+            for value in obj.values():
+                walk(value)
+
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+
+    walk(payload)
+    return mapping
 
 def verify_vendor_delivery(root: Path, extract: bool = False) -> tuple[bool, str]:
     verifier = root / "verify.py"
@@ -62,6 +90,41 @@ def verify_vendor_delivery(root: Path, extract: bool = False) -> tuple[bool, str
     output = (proc.stdout or "") + (proc.stderr or "")
     return proc.returncode == 0, output
 
+def classify_verifier_failures(
+    output: str,
+) -> tuple[set[str], set[str], list[str]]:
+    adjustment_files: set[str] = set()
+    manifest_missing_files: set[str] = set()
+    other_failures: list[str] = []
+
+    adjustment_re = re.compile(
+        r"^FAIL\s+\[(?P<name>[^\]]+)\]\s+adjustment "
+        r"(?:chain breaks|factor inconsistent)"
+    )
+    manifest_re = re.compile(
+        r"^FAIL\s+\[day_by_symbol/manifest\.json\]\s+"
+        r"manifest lists (?P<name>\S+) but it is missing"
+    )
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+
+        if not re.match(r"^FAIL\s+\[", line):
+            continue
+
+        match = adjustment_re.match(line)
+        if match:
+            adjustment_files.add(match.group("name"))
+            continue
+
+        match = manifest_re.match(line)
+        if match:
+            manifest_missing_files.add(match.group("name"))
+            continue
+
+        other_failures.append(line)
+
+    return adjustment_files, manifest_missing_files, other_failures
 
 def day_files(root: Path) -> list[Path]:
     folder = root / "day_by_symbol"
@@ -100,20 +163,48 @@ def _source_key(row: dict[str, str], terminal_symbol: str, delisted_at: str | No
     return f"SYMBOL:{terminal_symbol}|DELISTED:{delisted_at or ''}"
 
 
+def _resolve_lifecycle_row(candidates, source_file_name: str, delisted: str | None):
+    """Match status after the original filename's exact symbol and delisting date."""
+    if not candidates:
+        return {}
+    expected_status = "delisted" if delisted else "active"
+    matching = [(line, row) for line, row in candidates
+                if (row.get("status") or "").strip() == expected_status]
+    if not matching:
+        # Older metadata may omit status; an explicit incompatible status is not
+        # a fallback. In particular, renamed describes a previous symbol holder.
+        matching = [(line, row) for line, row in candidates
+                    if not (row.get("status") or "").strip()]
+    if len(matching) != 1:
+        reason = "Ambiguous" if matching else "Incompatible"
+        details = [{"symbols_csv_line": line, **row} for line, row in (matching or candidates)]
+        raise ValueError(
+            f"{reason} symbols.csv lifecycle metadata for {source_file_name}; "
+            f"expected status={expected_status}, delisted_at={delisted!r}; "
+            f"candidates={json.dumps(details, sort_keys=True)}"
+        )
+    return matching[0][1]
+
+
 def build_lifecycles(root: Path) -> list[Lifecycle]:
     files = day_files(root)
     symbol_rows = _symbols_rows(root)
+    filename_map = load_filename_map(root)
 
-    rows_by_key: dict[tuple[str, str | None], dict[str, str]] = {}
-    for row in symbol_rows:
+    rows_by_key: dict[tuple[str, str | None], list[tuple[int, dict[str, str]]]] = {}
+    for line, row in enumerate(symbol_rows, start=2):
         symbol = (row.get("symbol") or "").strip()
         delisted = (row.get("delisted_at") or "").strip() or None
-        rows_by_key[(symbol, delisted)] = row
+        rows_by_key.setdefault((symbol, delisted), []).append((line, row))
 
     result: list[Lifecycle] = []
     for path in files:
-        symbol, delisted = parse_day_filename(path)
-        row = rows_by_key.get((symbol, delisted), {})
+        local_rel = path.relative_to(root).as_posix()
+        original_rel = filename_map.get(local_rel, local_rel)
+        original_name = Path(original_rel).name
+
+        symbol, delisted = parse_day_filename(Path(original_name))
+        row = _resolve_lifecycle_row(rows_by_key.get((symbol, delisted), []), original_name, delisted)
         status = (row.get("status") or ("delisted" if delisted else "active")).strip()
         source_key = _source_key(row, symbol, delisted)
         result.append(
@@ -130,7 +221,8 @@ def build_lifecycles(root: Path) -> list[Lifecycle]:
                 figi=(row.get("figi") or "").strip() or None,
                 symbol_history=(row.get("symbol_history") or "").strip() or None,
                 metadata_completeness="FULL" if row else "PROVISIONAL",
-                source_file_name=path.name,
+                local_file_name=path.name,
+                source_file_name=original_name,
             )
         )
     return result
@@ -141,9 +233,11 @@ def parse_symbol_history(lifecycle: Lifecycle, first_date: str, last_date: str) 
 
     symbols.csv uses SYMBOL:from_date|SYMBOL2:from_date. The free sample does
     not ship symbols.csv, so its terminal symbol is provisional over the file range.
+    Delisted ticker intervals end on the last observed trading date; delisted_at
+    is an administrative lifecycle date, not an inclusive trading boundary.
     """
     if not lifecycle.symbol_history:
-        end = lifecycle.delisted_at or None
+        end = last_date if lifecycle.delisted_at else None
         return [(lifecycle.terminal_symbol, first_date, end)]
 
     items: list[tuple[str, str]] = []
@@ -157,7 +251,7 @@ def parse_symbol_history(lifecycle: Lifecycle, first_date: str, last_date: str) 
             next_start = date.fromisoformat(items[i + 1][1])
             end = (next_start - timedelta(days=1)).isoformat()
         else:
-            end = lifecycle.delisted_at or None
+            end = last_date if lifecycle.delisted_at else None
         intervals.append((symbol, start, end))
     return intervals
 
