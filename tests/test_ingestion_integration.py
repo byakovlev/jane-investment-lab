@@ -384,3 +384,109 @@ def test_ready_label_never_rebuilt(quarantine_delivery, monkeypatch, change):
     with duckdb.connect(db) as con:
         assert con.execute("SELECT * FROM dataset_version").fetchall() == before
         assert con.execute("SELECT * FROM ingestion_run").fetchall() == runs
+
+
+@pytest.fixture
+def overlapping_figi_delivery(tmp_path, monkeypatch):
+    import csv
+    from investment_lab import pipeline
+
+    source, project = tmp_path / "source", tmp_path / "project"
+    (source / "day_by_symbol").mkdir(parents=True)
+    (project / "schema").mkdir(parents=True)
+    shutil.copy2(ROOT / "schema/001_core.sql", project / "schema/001_core.sql")
+    fields = ["date", "open", "high", "low", "close", "volume", "vwap", "transactions",
+              "adj_open", "adj_high", "adj_low", "adj_close", "adj_volume", "adj_vwap",
+              "dividend", "dividend_type", "split"]
+    for symbol, dates in {"A": ["2024-01-02", "2024-01-03"], "B": ["2024-01-03", "2024-01-04"],
+                          "C": ["2024-01-05"], "SAFE": ["2024-01-02"]}.items():
+        with (source / "day_by_symbol" / f"{symbol}_day.csv").open("w") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            for date in dates:
+                writer.writerow(dict(date=date, open=10, high=12, low=9, close=10, volume=100,
+                                     vwap=10, transactions=5, adj_open=10, adj_high=12,
+                                     adj_low=9, adj_close=10, adj_volume=100, adj_vwap=10))
+    with (source / "symbols.csv").open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=["symbol", "status", "figi", "symbol_history"])
+        writer.writeheader()
+        for symbol in ("A", "B", "C", "SAFE"):
+            writer.writerow(dict(symbol=symbol, status="active", figi="SAFE" if symbol == "SAFE" else "SHARED",
+                                 symbol_history="SAFE:2024-01-01" if symbol == "SAFE" else "SHARED:2024-01-01"))
+    monkeypatch.setattr(pipeline, "verify_vendor_delivery", lambda *a, **kw: (True, ""))
+    return source, project
+
+
+@pytest.mark.parametrize("field,value", [("close", "11"), ("volume", "200"), ("vwap", ""), ("transactions", "6")])
+@pytest.mark.parametrize("ticker_conflict", [False, True])
+def test_cross_file_market_conflict_quarantines_whole_security(
+    overlapping_figi_delivery, monkeypatch, field, value, ticker_conflict,
+):
+    import csv
+    import json
+    from investment_lab import pipeline
+    from investment_lab.research.frame import load_research_frame
+
+    source, project = overlapping_figi_delivery
+    path = source / "day_by_symbol/B_day.csv"
+    with path.open() as f:
+        reader = csv.DictReader(f)
+        fields, rows = reader.fieldnames, list(reader)
+    rows[0][field] = value
+    with path.open("w") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    if ticker_conflict:
+        path = source / "symbols.csv"
+        path.write_text(path.read_text().replace("A,active,SHARED,SHARED:", "A,active,SHARED,DIFFERENT:"))
+    # Adjustment quarantine overlaps price quarantine and must not double-count exclusions.
+    monkeypatch.setattr(pipeline, "verify_vendor_delivery", lambda *a, **kw: (
+        False, "FAIL [A_day.csv] adjustment factor inconsistent on 1 rows",
+    ))
+    summary = pipeline.ingest_historicaldata_net(source, project, "overlap")
+    assert summary["daily_rows"] == 6
+    assert summary["research_rows"] == summary["adjusted_rows"] == 1
+    assert summary["identity_quarantined_securities"] == 1
+    assert summary["identity_quarantined_files"] == 3
+    assert summary["identity_quarantined_rows"] == 5
+    assert summary["raw_conflict_quarantined_securities"] == 1
+    assert summary["raw_conflicting_date_pairs"] == 1
+    assert summary["raw_rows_on_conflicting_dates"] == 2
+    assert summary["raw_conflict_quarantined_rows"] == 5
+    with duckdb.connect(str(project / "warehouse/metadata.duckdb")) as con:
+        security_id, details = con.execute("SELECT security_id,details_json FROM identity_history_quarantine").fetchone()
+        q = json.loads(details)
+        assert set(q["reasons"]) == ({"ticker_history_conflict", "conflicting_raw_observations"}
+                                     if ticker_conflict else {"conflicting_raw_observations"})
+        assert q["file_count"] == 3 and q["row_count"] == 5
+        assert q["raw_observation_conflict"]["source_files"] == ["A_day.csv", "B_day.csv"]
+        assert q["raw_observation_conflict"]["conflicting_date_count"] == 1
+        assert q["raw_observation_conflict"]["rows_on_conflicting_dates"] == 2
+        assert {f["source_file_name"] for f in q["source_files"]} == {"A_day.csv", "B_day.csv", "C_day.csv"}
+        assert con.execute("SELECT count(*) FROM bars_daily_raw_current").fetchone()[0] == 6
+        assert con.execute("SELECT count(*) FROM bars_daily_raw_current WHERE security_id=?", [security_id]).fetchone()[0] == 5
+        assert con.execute("SELECT count(*) FROM source_file").fetchone()[0] == 4
+        assert con.execute("SELECT count(*) FROM security_identifier_history WHERE security_id=?", [security_id]).fetchone()[0] == 0
+        assert con.execute("SELECT status,observed_value FROM quality_check_result WHERE check_name='no_duplicate_security_dates'").fetchone() == ("PASS", "0")
+    for labels in (False, True):
+        frame = load_research_frame(project, include_labels=labels)
+        assert len(frame) == 1
+        assert security_id not in set(frame.security_id)
+    assert pipeline.ingest_historicaldata_net(source, project, "overlap") == summary
+    assert security_id not in set(load_research_frame(project).security_id)
+
+
+def test_identical_cross_file_rows_are_not_price_conflicts(overlapping_figi_delivery):
+    from investment_lab import pipeline
+
+    source, project = overlapping_figi_delivery
+    # This change grants no permission to choose/deduplicate identical source rows.
+    # The existing research duplicate-key validation still rejects them.
+    with pytest.raises(RuntimeError, match="Canonical validation failed"):
+        pipeline.ingest_historicaldata_net(source, project, "identical")
+    with duckdb.connect(str(project / "warehouse/metadata.duckdb")) as con:
+        assert con.execute("SELECT count(*) FROM identity_history_quarantine").fetchone()[0] == 0
+        assert con.execute("SELECT observed_value FROM quality_check_result WHERE check_name='raw_conflicting_date_pairs'").fetchone()[0] == "0"
+        assert con.execute("SELECT count(*) FROM bars_daily_raw_current").fetchone()[0] == 6
+        assert con.execute("SELECT status,observed_value FROM quality_check_result WHERE check_name='no_duplicate_security_dates'").fetchone() == ("FAIL", "1")

@@ -146,6 +146,75 @@ def _validated_ticker_history(con, run_id, lifecycles, stats):
     ], quarantines
 
 
+def _quarantine_raw_conflicts(con, run_id, lifecycles, stats, ticker_quarantines):
+    """Quarantine securities with conflicting market observations across files.
+
+    Compare values directly (including NULLs), not hashes containing filenames.
+    Restrict the scan to securities represented by multiple source files.
+    """
+    con.execute("""CREATE OR REPLACE TEMP TABLE _conflicting_raw_dates AS
+        SELECT m.security_id, v.date AS trade_date, count(*) AS row_count,
+               list(DISTINCT m.source_file_name ORDER BY m.source_file_name) AS source_files
+        FROM _vendor_daily v JOIN _lifecycle_map m USING (local_file_name)
+        WHERE m.security_id IN (
+            SELECT security_id FROM _lifecycle_map GROUP BY 1
+            HAVING count(DISTINCT local_file_name) > 1
+        )
+        GROUP BY 1,2
+        HAVING count(DISTINCT v.local_file_name) > 1
+           AND count(DISTINCT (v.open, v.high, v.low, v.close,
+                              v.volume, v.vwap, v.transactions)) > 1
+    """)
+    conflicts = con.execute("""
+        SELECT security_id, count(*), sum(row_count), min(trade_date), max(trade_date)
+        FROM _conflicting_raw_dates GROUP BY 1 ORDER BY 1
+    """).fetchall()
+    conflicting_files = dict(con.execute("""
+        SELECT security_id, list(DISTINCT source_file ORDER BY source_file)
+        FROM _conflicting_raw_dates, UNNEST(source_files) AS f(source_file)
+        GROUP BY 1
+    """).fetchall())
+    quarantines = {q["security_id"]: q for q in ticker_quarantines}
+    for q in quarantines.values():
+        q["reasons"] = ["ticker_history_conflict"]
+    for security_id, dates, rows, first, last in conflicts:
+        if security_id not in quarantines:
+            quarantines[security_id] = {
+                "security_id": security_id,
+                "source_files": [
+                    {"local_file_name": lc.local_file_name, "source_file_name": lc.source_file_name,
+                     "symbol_history": lc.symbol_history, "source_security_key": lc.source_security_key,
+                     "rows": stats[lc.local_file_name]["rows"]}
+                    for lc in lifecycles if lc.security_id == security_id
+                ],
+                "conflicts": [], "reasons": [],
+            }
+        q = quarantines[security_id]
+        q["reasons"].append("conflicting_raw_observations")
+        q["raw_observation_conflict"] = {
+            "conflicting_date_count": dates,
+            "rows_on_conflicting_dates": rows,
+            "first_conflicting_date": str(first), "last_conflicting_date": str(last),
+            "source_files": conflicting_files[security_id],
+            "compared_fields": ["open", "high", "low", "close", "volume", "vwap", "transactions"],
+        }
+    for q in quarantines.values():
+        q["file_count"] = len(q["source_files"])
+        q["row_count"] = sum(f["rows"] for f in q["source_files"])
+    price_quarantines = [quarantines[sid] for sid, *_ in conflicts]
+    counts = {
+        "raw_conflict_quarantined_securities": len(price_quarantines),
+        "raw_conflict_quarantined_files": sum(q["file_count"] for q in price_quarantines),
+        "raw_conflict_quarantined_rows": sum(q["row_count"] for q in price_quarantines),
+        "raw_conflicting_date_pairs": sum(dates for _, dates, *_ in conflicts),
+        "raw_rows_on_conflicting_dates": sum(rows for _, _, rows, *_ in conflicts),
+    }
+    for name, count in counts.items():
+        _record_check(con, run_id, name, "SKIP" if count else "PASS", count, 0,
+                      severity="WARNING" if count else "INFO")
+    return list(quarantines.values()), counts
+
+
 def _create_current_views(con, raw_root, adjusted_root):
     # Keep the full raw archive available for provenance, including identity quarantine.
     con.execute(f"CREATE OR REPLACE VIEW bars_daily_raw_current AS SELECT * FROM read_parquet('{_sql_path(raw_root)}/**/*.parquet', hive_partitioning=true)")
@@ -396,6 +465,12 @@ def ingest_historicaldata_net(
     temp_map = Path(tempfile.mkstemp(prefix="lifecycle_map_", suffix=".csv")[1])
     try:
         ticker_history, identity_quarantines = _validated_ticker_history(con, run_id, lifecycles, stats)
+        _write_lifecycle_map(temp_map, lifecycles)
+        con.execute("DROP TABLE IF EXISTS _lifecycle_map")
+        con.execute(f"CREATE TEMP TABLE _lifecycle_map AS SELECT * FROM read_csv_auto('{_sql_path(temp_map)}', header=true)")
+        identity_quarantines, raw_conflict_counts = _quarantine_raw_conflicts(
+            con, run_id, lifecycles, stats, identity_quarantines,
+        )
         identity_ids = {q["security_id"] for q in identity_quarantines}
         identity_files = sum(len(q["source_files"]) for q in identity_quarantines)
         identity_rows = sum(f["rows"] for q in identity_quarantines for f in q["source_files"])
@@ -411,9 +486,6 @@ def ingest_historicaldata_net(
         ):
             _record_check(con, run_id, name, "SKIP" if count else "PASS", count, 0,
                           severity="WARNING" if count else "INFO")
-        _write_lifecycle_map(temp_map, lifecycles)
-        con.execute("DROP TABLE IF EXISTS _lifecycle_map")
-        con.execute(f"CREATE TEMP TABLE _lifecycle_map AS SELECT * FROM read_csv_auto('{_sql_path(temp_map)}', header=true)")
 
         # Replace only the source lifecycle rows represented by this immutable dataset version.
         for lc in lifecycles:
@@ -455,6 +527,8 @@ def ingest_historicaldata_net(
                  json.dumps({"symbol_history": lc.symbol_history, "source_file_name": lc.source_file_name})],
             )
         for security_id, symbol, start, end in ticker_history:
+            if security_id in identity_ids:
+                continue
             con.execute(
                 "INSERT INTO security_identifier_history VALUES (?, 'TICKER', ?, 'US_EQUITY', ?, ?, ?)",
                 [security_id, symbol, start, end, dataset_version_id],
@@ -669,6 +743,7 @@ def ingest_historicaldata_net(
             "identity_quarantined_securities": len(identity_ids),
             "identity_quarantined_files": identity_files,
             "identity_quarantined_rows": identity_rows,
+            **raw_conflict_counts,
             "adjusted_rows": adjusted_count,
             "adjusted_quarantined_files": quarantined_file_count,
             "adjusted_quarantined_rows": quarantined_row_count,
